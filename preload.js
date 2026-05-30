@@ -40,10 +40,6 @@ const ALLOWED_CHANNELS = [
   // Print
   'PRINT_HTML',
   'PRINT_TO_PDF',
-  // Auto-update
-  'CHECK_FOR_UPDATE',
-  'DOWNLOAD_UPDATE',
-  'RESTART_APP',
 ]
 
 contextBridge.exposeInMainWorld('electronAPI', {
@@ -52,8 +48,5 @@ contextBridge.exposeInMainWorld('electronAPI', {
       return Promise.reject(new Error(`IPC channel "${channel}" is not permitted`))
     }
     return ipcRenderer.invoke(channel, ...args)
-  },
-  onUpdateStatus: (callback) => {
-    ipcRenderer.on('UPDATE_STATUS', (_e, status) => callback(status))
   }
 })

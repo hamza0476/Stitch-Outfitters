@@ -12,9 +12,6 @@ const fs   = require('fs')
 
 const { state: paths, initPaths, ensureDirs, migrateDataFromDocuments } = require('./src/main/paths')
 const db = require('./src/main/database')
-const { autoUpdater } = require('electron-updater')
-autoUpdater.autoDownload = false
-autoUpdater.autoInstallOnAppQuit = true
 
 let win = null
 
@@ -46,12 +43,6 @@ app.whenReady().then(() => {
   win.loadFile('index.html')
   win.setMenu(null)
   win.once('ready-to-show', () => win.show())
-
-  autoUpdater.on('checking-for-update', () => win?.webContents.send('UPDATE_STATUS', 'checking'))
-  autoUpdater.on('update-available', (info) => win?.webContents.send('UPDATE_STATUS', { status: 'available', info }))
-  autoUpdater.on('update-not-available', () => win?.webContents.send('UPDATE_STATUS', 'not-available'))
-  autoUpdater.on('download-progress', (p) => win?.webContents.send('UPDATE_STATUS', { status: 'downloading', progress: Math.round(p.percent) }))
-  autoUpdater.on('update-downloaded', () => win?.webContents.send('UPDATE_STATUS', 'downloaded'))
 
   db.setWinRef(win)
   db.registerHandlers(ipcMain)
@@ -86,13 +77,6 @@ app.whenReady().then(() => {
 
   ipcMain.handle('OPEN_DATA_FOLDER',   () => { shell.openPath(paths.dataDir || '');  return { ok: true } })
   ipcMain.handle('OPEN_BACKUP_FOLDER', () => { shell.openPath(paths.backupDir || ''); return { ok: true } })
-
-  ipcMain.handle('CHECK_FOR_UPDATE',  () => autoUpdater.checkForUpdates())
-  ipcMain.handle('DOWNLOAD_UPDATE',   () => autoUpdater.downloadUpdate())
-  ipcMain.handle('RESTART_APP',       () => autoUpdater.quitAndInstall())
-
-  // ── Check for updates on startup ──────────────────────────────────
-  setTimeout(() => autoUpdater.checkForUpdates(), 5000)
 
   // ── Print handlers ─────────────────────────────────────────────────
   ipcMain.handle('PRINT_HTML', async (e, { html, title, landscape, paperSize }) => {

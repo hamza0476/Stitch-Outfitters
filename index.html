@@ -1734,10 +1734,6 @@ tbody tr:hover td{background:var(--off-white)}
       Settings
     </div>
   </nav>
-  <div class="sb-footer" style="margin-top:auto;padding:12px 14px;border-top:1px solid var(--slate);font-size:11px;color:var(--light-muted);display:flex;justify-content:space-between;align-items:center">
-    <span>v<span id="sb-version">5.1.0</span></span>
-    <span id="sb-update-status" style="cursor:pointer;color:var(--accent)" onclick="nav('settings',document.querySelectorAll('.nav-item')[document.querySelectorAll('.nav-item').length-1])"><span id="sb-update-icon">↻</span> <span id="sb-update-text">Check Update</span></span>
-  </div>
 </aside>
 
 <!-- MAIN -->
@@ -2243,27 +2239,6 @@ tbody tr:hover td{background:var(--off-white)}
         <div id="cp-success" style="display:none;background:var(--success-bg);border:1px solid var(--success-border);border-radius:var(--r-sm);padding:9px 13px;font-size:12.5px;color:var(--success);margin-bottom:12px"></div>
 
         <button class="bp" onclick="changePassword()" style="max-width:200px">🔒 Update Password</button>
-      </div>
-
-      <!-- APP UPDATES -->
-      <div class="set-section" style="margin-top:16px;max-width:520px">
-        <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">
-          <svg width="16" height="16" viewBox="0 0 20 20" fill="var(--accent)"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-13a1 1 0 10-2 0v.092a4.535 4.535 0 00-1.676.662C6.602 6.234 6 7.009 6 8c0 .99.602 1.765 1.324 2.246.48.32 1.054.545 1.676.662v1.941c-.391-.127-.68-.317-.843-.504a1 1 0 10-1.51 1.31c.562.649 1.413 1.076 2.353 1.253V15a1 1 0 102 0v-.092a4.535 4.535 0 001.676-.662C13.398 13.766 14 12.991 14 12c0-.99-.602-1.765-1.324-2.246A4.535 4.535 0 0011 9.092V7.151c.391.127.68.317.843.504a1 1 0 101.511-1.31c-.563-.649-1.413-1.076-2.354-1.253V5z" clip-rule="evenodd"/></svg>
-          <div class="set-title">App Updates</div>
-        </div>
-        <div class="set-sub" style="margin-bottom:18px">Check for new versions of Stitch Outfitters</div>
-        <div style="font-size:13px;color:var(--muted);margin-bottom:14px">
-          Current version: <strong>v<span id="set-version">5.1.0</span></strong>
-        </div>
-
-        <!-- Update status area -->
-        <div id="set-update-area" style="display:none;padding:10px 14px;border-radius:var(--r-sm);font-size:13px;margin-bottom:12px"></div>
-
-        <div style="display:flex;gap:10px;flex-wrap:wrap">
-          <button class="bp" id="set-check-btn" onclick="checkForUpdates()">🔍 Check for Updates</button>
-          <button class="bp" id="set-download-btn" style="display:none;background:var(--accent);color:#fff" onclick="downloadUpdate()">⬇ Download Update</button>
-          <button class="bp" id="set-restart-btn" style="display:none;background:var(--success);color:#fff" onclick="restartApp()">🔄 Restart to Install</button>
-        </div>
       </div>
 
     </div>
@@ -9534,131 +9509,6 @@ function copyAddressToClipboardLegacy(uid) {
     document.body.removeChild(textarea);
     toast('Address copied to clipboard!', 'success');
   }
-}
-
-// ── Auto-update (Settings page + sidebar) ────────────
-let _updateInfo = null
-
-function updEl(id) { return document.getElementById(id) }
-
-function setUpdateStatus(type, msg) {
-  // Sidebar indicator
-  const sbIcon = updEl('sb-update-icon')
-  const sbText = updEl('sb-update-text')
-  // Settings area
-  const area = updEl('set-update-area')
-  const checkBtn = updEl('set-check-btn')
-  const dlBtn = updEl('set-download-btn')
-  const rstBtn = updEl('set-restart-btn')
-
-  area.style.display = type === 'hidden' ? 'none' : 'block'
-
-  switch (type) {
-    case 'hidden':
-    case 'idle':
-      area.style.display = 'none'
-      sbIcon.textContent = '↻'
-      sbText.textContent = 'Check Update'
-      break
-    case 'checking':
-      area.style.background = 'var(--info-bg)'
-      area.style.border = '1px solid var(--info-border)'
-      area.style.color = 'var(--info)'
-      area.textContent = '⏳ Checking for updates...'
-      checkBtn.disabled = true
-      sbIcon.textContent = '⏳'
-      sbText.textContent = 'Checking...'
-      break
-    case 'current':
-      area.style.background = 'var(--success-bg)'
-      area.style.border = '1px solid var(--success-border)'
-      area.style.color = 'var(--success)'
-      area.textContent = '✓ You have the latest version'
-      checkBtn.disabled = false
-      dlBtn.style.display = 'none'
-      rstBtn.style.display = 'none'
-      sbIcon.textContent = '✓'
-      sbText.textContent = 'Up to date'
-      break
-    case 'available':
-      area.style.background = 'var(--info-bg)'
-      area.style.border = '1px solid var(--info-border)'
-      area.style.color = 'var(--info)'
-      area.innerHTML = '📦 Update <strong>v' + msg.version + '</strong> available'
-      checkBtn.disabled = false
-      dlBtn.style.display = 'inline-block'
-      rstBtn.style.display = 'none'
-      sbIcon.textContent = '📦'
-      sbText.textContent = 'v' + msg.version + ' ready'
-      break
-    case 'downloading':
-      area.style.background = 'var(--info-bg)'
-      area.style.border = '1px solid var(--info-border)'
-      area.style.color = 'var(--info)'
-      area.textContent = '⬇ Downloading... ' + msg + '%'
-      checkBtn.disabled = true
-      dlBtn.style.display = 'none'
-      rstBtn.style.display = 'none'
-      sbIcon.textContent = '⬇'
-      sbText.textContent = msg + '%'
-      break
-    case 'downloaded':
-      area.style.background = 'var(--success-bg)'
-      area.style.border = '1px solid var(--success-border)'
-      area.style.color = 'var(--success)'
-      area.innerHTML = '✅ Update <strong>v' + msg + '</strong> downloaded — ready to install'
-      checkBtn.disabled = false
-      dlBtn.style.display = 'none'
-      rstBtn.style.display = 'inline-block'
-      sbIcon.textContent = '✅'
-      sbText.textContent = 'Restart to update'
-      break
-  }
-}
-
-if (window.electronAPI && window.electronAPI.onUpdateStatus) {
-  window.electronAPI.onUpdateStatus((status) => {
-    if (typeof status === 'string') {
-      switch (status) {
-        case 'checking':
-          setUpdateStatus('checking')
-          break
-        case 'not-available':
-          setUpdateStatus('current')
-          break
-        case 'downloaded':
-          setUpdateStatus('downloaded', _updateInfo ? _updateInfo.version : '')
-          break
-      }
-    } else {
-      switch (status.status) {
-        case 'available':
-          _updateInfo = status.info
-          setUpdateStatus('available', status.info)
-          break
-        case 'downloading':
-          setUpdateStatus('downloading', status.progress)
-          break
-      }
-    }
-  })
-}
-
-function checkForUpdates() {
-  if (!window.electronAPI) { toast('Updates not available in browser', 'warn'); return }
-  setUpdateStatus('checking')
-  window.electronAPI.invoke('CHECK_FOR_UPDATE')
-}
-
-function downloadUpdate() {
-  if (!window.electronAPI) return
-  window.electronAPI.invoke('DOWNLOAD_UPDATE')
-  _updateInfo = null
-}
-
-function restartApp() {
-  if (!window.electronAPI) return
-  window.electronAPI.invoke('RESTART_APP')
 }
 
 </script>
