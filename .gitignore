@@ -1,0 +1,7 @@
+node_modules/
+dist/
+*.db
+*.sqlite
+test-data.json
+.DS_Store
+Thumbs.db

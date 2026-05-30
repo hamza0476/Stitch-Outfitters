@@ -1,0 +1,103 @@
+{
+  "name": "stitch-outfitters",
+  "version": "5.1.0",
+  "description": "Stitch Outfitters - Scalable Tailor Management System",
+  "main": "main.js",
+  "author": "Stitch Outfitters",
+  "license": "ISC",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win --x64",
+    "build:portable": "electron-builder --win --x64 --portable",
+    "build:mac": "electron-builder --mac --x64 --arm64",
+    "build:all": "electron-builder --win --x64 --portable --mac --x64 --arm64",
+    "rebuild": "npx @electron/rebuild -f -w better-sqlite3 --electronVersion 33.4.0",
+    "publish": "electron-builder --win --x64 --mac --x64 --arm64 --publish always"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^3.6.0",
+    "electron": "33.4.0",
+    "electron-builder": "25.1.8"
+  },
+  "build": {
+    "appId": "com.stitchoutfitters.app",
+    "productName": "Stitch Outfitters",
+    "copyright": "Copyright © 2025 Stitch Outfitters",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "assets/**/*",
+      "main.js",
+      "index.html",
+      "preload.js",
+      "icon.ico",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "node_modules/better-sqlite3/build/Release/",
+        "to": "app/node_modules/better-sqlite3/build/Release/",
+        "filter": [
+          "better_sqlite3.node"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "icon.ico",
+      "legalTrademarks": "Stitch Outfitters®",
+      "artifactName": "${productName} Setup ${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Stitch Outfitters",
+      "installerIcon": "icon.ico",
+      "uninstallerIcon": "icon.ico",
+      "installerHeaderIcon": "icon.ico",
+      "deleteAppDataOnUninstall": false
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "icon": "icon.icns",
+      "category": "public.app-category.business",
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "hamza0476",
+      "repo": "Stitch-Outfitters"
+    }
+  },
+  "dependencies": {
+    "better-sqlite3": "12.8.0",
+    "electron-updater": "^6.8.3"
+  }
+}
