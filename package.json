@@ -11,8 +11,9 @@
     "build:portable": "electron-builder --win --x64 --portable",
     "build:mac": "electron-builder --mac --x64 --arm64",
     "build:all": "electron-builder --win --x64 --portable --mac --x64 --arm64",
+    "postinstall": "electron-builder install-app-deps",
     "rebuild": "npx @electron/rebuild -f -w better-sqlite3 --electronVersion 33.4.0",
-    "publish": "electron-builder --win --x64 --mac --x64 --arm64 --publish always"
+    "publish": "electron-builder --win --x64 --publish always"
   },
   "devDependencies": {
     "@electron/rebuild": "^3.6.0",
