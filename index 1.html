@@ -2657,16 +2657,29 @@ tbody tr:hover td{background:var(--off-white)}
           </div>
         </div>
         
-        <!-- Delivery Charges -->
+        <!-- Delivery Charges & Garment Type -->
         <div class="fr" style="margin-bottom:12px;gap:12px;">
           <div class="fg">
             <label class="fla">🚚 Delivery Charges (Rs)</label>
             <input class="fi" id="ao-delivery-charge" type="number" placeholder="0" min="0" step="any" oninput="updateGrandTotal();" style="background:var(--info-bg);border-color:var(--info-border);border-radius:10px;"/>
             <div style="font-size:10px;color:var(--muted);margin-top:3px;">Extra shipping/delivery fee</div>
           </div>
+          <div class="fg">
+            <label class="fla">👔 Garment Type</label>
+            <select class="fsel" id="ao-garment" style="border-radius:10px;">
+              <option value="">Select garment…</option>
+              <option>Shalwar Kameez</option>
+              <option>Kurta Trouser</option>
+              <option>Sherwani</option>
+              <option>Waistcoat</option>
+              <option>Coat</option>
+              <option>Shirt</option>
+              <option>Trouser</option>
+              <option>Pant</option>
+              <option>Other</option>
+            </select>
+          </div>
         </div>
-        <!-- Hidden garment field kept for backward-compatibility with save/load logic -->
-        <input type="hidden" id="ao-garment" value=""/>
         
       </div>
 
@@ -4681,10 +4694,12 @@ function renderBooking() {
           '<button onclick="showAddrPopup(\'' + c.uid + '\')" style="background:none;border:1px solid var(--border-strong);border-radius:3px;padding:0 4px;cursor:pointer;font-size:9px;color:var(--muted);line-height:1.7;flex-shrink:0" title="View full address">📍</button></div>';
       })()}</td>
       <td>${tagBadge(c.tag)}</td>
-      <td style="text-align:center"><div style="display:flex;align-items:center;justify-content:center;gap:4px"><span style="font-size:11px">${ol.length}</span><button class="ex-tog" onclick="showOrdersPopup('${c.uid}')">📋</button></div></td>
+      <td style="text-align:center"><div style="display:flex;align-items:center;justify-content:center;gap:4px"><span style="font-size:11px">${ol.length}</span><button class="ex-tog" onclick="togExp('${c.uid}')">${exp ? '▲' : '▼'}</button></div></td>
       <td>${c.measurements ? `<button class="mb-btn" onclick="viewMeas('${c.uid}')">📐 View</button>` : `<span style="font-size:10.5px;color:var(--light-muted)">None</span>`}</td>
       <td><div class="act-w">
         <button class="act wa" onclick="sendWA('${c.uid}')" title="WhatsApp">${WA_ICON}</button>
+        <button class="act iv" onclick="showInv('${c.uid}','')" title="Invoice">🧾</button>
+        <button class="act tk" onclick="showToken('${c.uid}','')" title="Token Slip">🎫</button>
         <button class="act" style="color:#7C3AED" onclick="showHist('${c.uid}')" title="History">🕐</button>
         <button class="act ed" onclick="openEdit('${c.uid}')" title="Edit">✏</button>
         <button class="act dl" onclick="askDel('${c.uid}')" title="Delete">🗑</button>
@@ -5749,9 +5764,7 @@ function buildFabricRows(n) {
       manual: r.querySelector('.fab-manual-inp')?.value || '',
       invId: r.querySelector('.fab-inv-sel')?.value || '',
       meters: r.querySelector('.fab-meters-inp')?.value || '',
-      piecePrice: r.querySelector('.fab-piece-price')?.value || '',
-      garment: r.querySelector('.fab-garment-sel')?.value || '',
-      stitchType: r.querySelector('.fab-stitch-sel')?.value || ''
+      piecePrice: r.querySelector('.fab-piece-price')?.value || ''
     });
   });
 
@@ -5768,7 +5781,7 @@ function buildFabricRows(n) {
   const defaultPricePerPiece = qty > 0 ? Math.round(netTotal / qty) : 0;
 
   for (let i = 0; i < qty; i++) {
-    const prev = existing[i] || { mode: 'manual', manual: '', invId: '', meters: '', piecePrice: '', garment: '', stitchType: '' };
+    const prev = existing[i] || { mode: 'manual', manual: '', invId: '', meters: '', piecePrice: '' };
     
     // Set piece price - rounded, no decimals
     let piecePrice = prev.piecePrice;
@@ -5777,22 +5790,6 @@ function buildFabricRows(n) {
     } else {
       piecePrice = Math.round(parseFloat(piecePrice) || 0);
     }
-
-    const garmentOpts = `<option value="">Select garment…</option>
-      <option${prev.garment==='Shalwar Kameez'?' selected':''}>Shalwar Kameez</option>
-      <option${prev.garment==='Kurta Trouser'?' selected':''}>Kurta Trouser</option>
-      <option${prev.garment==='Sherwani'?' selected':''}>Sherwani</option>
-      <option${prev.garment==='Waistcoat'?' selected':''}>Waistcoat</option>
-      <option${prev.garment==='Coat'?' selected':''}>Coat</option>
-      <option${prev.garment==='Shirt'?' selected':''}>Shirt</option>
-      <option${prev.garment==='Trouser'?' selected':''}>Trouser</option>
-      <option${prev.garment==='Pant'?' selected':''}>Pant</option>
-      <option${prev.garment==='Other'?' selected':''}>Other</option>`;
-
-    const stitchOpts = `<option value="">Select stitch type…</option>
-      <option value="Simple"${prev.stitchType==='Simple'?' selected':''}>Simple</option>
-      <option value="Design"${prev.stitchType==='Design'?' selected':''}>Design</option>
-      <option value="Simple Design"${prev.stitchType==='Simple Design'?' selected':''}>Simple Design</option>`;
 
     const row = document.createElement('div');
     row.className = 'fab-row';
@@ -5808,18 +5805,6 @@ function buildFabricRows(n) {
         <div class="fab-toggle" style="display:flex;gap:6px;background:#F0EDE8;border-radius:20px;padding:3px">
           <button type="button" class="fab-mode-btn fab-mode-manual${prev.mode === 'manual' ? ' active' : ''}" style="padding:4px 12px;border-radius:16px;border:1px solid ${prev.mode === 'manual' ? 'var(--charcoal)' : 'var(--border)'};font-size:11px;font-family:'DM Sans',sans-serif;cursor:pointer;font-weight:500;background:${prev.mode === 'manual' ? 'var(--charcoal)' : 'var(--ivory)'};color:${prev.mode === 'manual' ? '#FAF8F5' : 'var(--muted)'}" onclick="setRowFabMode(this,'manual')">✏ Manual</button>
           <button type="button" class="fab-mode-btn fab-mode-inv${prev.mode === 'inventory' ? ' active' : ''}" style="padding:4px 12px;border-radius:16px;border:1px solid ${prev.mode === 'inventory' ? 'var(--charcoal)' : 'var(--border)'};font-size:11px;font-family:'DM Sans',sans-serif;cursor:pointer;font-weight:500;background:${prev.mode === 'inventory' ? 'var(--charcoal)' : 'var(--ivory)'};color:${prev.mode === 'inventory' ? '#FAF8F5' : 'var(--muted)'}" onclick="setRowFabMode(this,'inventory')">📦 Inventory</button>
-        </div>
-      </div>
-
-      <!-- GARMENT TYPE + STITCH TYPE PER PIECE -->
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px;">
-        <div class="fg">
-          <label style="font-size:10px;font-weight:600;color:var(--muted);margin-bottom:5px;display:block">👔 Garment Type</label>
-          <select class="fsel fab-garment-sel" style="width:100%;border-radius:10px;">${garmentOpts}</select>
-        </div>
-        <div class="fg">
-          <label style="font-size:10px;font-weight:600;color:var(--muted);margin-bottom:5px;display:block">🧵 Stitch Type</label>
-          <select class="fsel fab-stitch-sel" style="width:100%;border-radius:10px;">${stitchOpts}</select>
         </div>
       </div>
       
@@ -5842,12 +5827,7 @@ function buildFabricRows(n) {
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:8px">
           <div class="fg">
             <label class="fla" style="font-size:10px">From Inventory</label>
-            <div style="position:relative;">
-              <input type="text" class="fi fab-inv-search" placeholder="🔍 Search fabric…" autocomplete="off"
-                style="width:100%;margin-bottom:4px;padding:6px 10px;font-size:11px;border-radius:8px;border:1px solid var(--border);"
-                oninput="(function(inp){const sel=inp.closest('.fg').querySelector('.fab-inv-sel');const q=inp.value.toLowerCase();Array.from(sel.options).forEach(o=>{o.style.display=(!o.value||o.text.toLowerCase().includes(q))?'':'none'});if(sel.selectedIndex>-1&&sel.options[sel.selectedIndex]&&sel.options[sel.selectedIndex].style.display==='none'){sel.value='';}})(this)"/>
-              <select class="fsel fab-inv-sel" style="width:100%" onchange="onRowFabricChange(this)">${fabOpts}</select>
-            </div>
+            <select class="fsel fab-inv-sel" style="width:100%" onchange="onRowFabricChange(this)">${fabOpts}</select>
           </div>
           <div class="fg">
             <label class="fla" style="font-size:10px">Qty to Use <span class="fab-stock-lbl" style="color:var(--success);font-weight:600;font-size:10px"></span></label>
@@ -6219,7 +6199,7 @@ let fabSrc='manual'; // kept for backward compat with openEditOrd
 function setFabSrc(src){ fabSrc=src; }
 function onFabricSelect(){}  // no-op (replaced by per-row handlers)
 
-// Collect all fabric rows → array of {fabric, invId, invQty, garment, stitchType}
+// Collect all fabric rows → array of {fabric, invId, invQty}
 function collectFabricRows() {
   const rows = document.querySelectorAll('#ao-fab-rows .fab-row');
   const result = [];
@@ -6235,10 +6215,6 @@ function collectFabricRows() {
       row.querySelector('.fab-piece-price')?.focus();
       return null;
     }
-
-    // Get per-piece garment and stitch type
-    const garment = row.querySelector('.fab-garment-sel')?.value || '';
-    const stitchType = row.querySelector('.fab-stitch-sel')?.value || '';
     
     if (mode === 'inventory') {
       const invId = row.querySelector('.fab-inv-sel')?.value || '';
@@ -6270,9 +6246,7 @@ function collectFabricRows() {
         invId: invId,
         invQty: meters,
         unit: item.unit,
-        price: piecePrice,
-        garment: garment,
-        stitchType: stitchType
+        price: piecePrice  // Individual piece price
       });
     } else {
       const manual = row.querySelector('.fab-manual-inp')?.value || '';
@@ -6281,9 +6255,7 @@ function collectFabricRows() {
         invId: null,
         invQty: 0,
         unit: null,
-        price: piecePrice,
-        garment: garment,
-        stitchType: stitchType
+        price: piecePrice  // Individual piece price
       });
     }
   }
@@ -6487,12 +6459,6 @@ function openEditOrd(uid, oid) {
             }
           }, 500);
         }
-
-        // ===== Restore garment type and stitch type per piece =====
-        const garmentSel = row.querySelector('.fab-garment-sel');
-        if (garmentSel && piece.garment) garmentSel.value = piece.garment;
-        const stitchSel = row.querySelector('.fab-stitch-sel');
-        if (stitchSel && piece.stitchType) stitchSel.value = piece.stitchType;
         
         // ===== Restore fabric based on type =====
         if (piece.invFabricId && piece.invFabricUsed > 0) {
@@ -6730,9 +6696,7 @@ async function submitNewOrder() {
         fabric: fabRow.fabric,
         invFabricId: fabRow.invId,
         invFabricUsed: fabRow.invQty,
-        price: Math.round(fabRow.price || 0),
-        garment: fabRow.garment || '',
-        stitchType: fabRow.stitchType || ''
+        price: Math.round(fabRow.price || 0)
       });
     }
 
@@ -6782,7 +6746,7 @@ async function submitNewOrder() {
     o.delivery = eoDelivery;
     o.payStatus = document.getElementById('ao-pay').value;
     o.advance = Math.round(parseFloat(document.getElementById('ao-advance').value) || 0);
-    o.garment = fabRows[0]?.garment || document.getElementById('ao-garment').value || o.garment || '';
+    o.garment = document.getElementById('ao-garment').value;
     o.fabric = fabRows.map(r => r.fabric).filter(Boolean).join(', ') || '';
     o.design = (document.getElementById('ao-design')||{value:''}).value;
     o.pieces = pieces;
@@ -6856,9 +6820,7 @@ async function submitNewOrder() {
       fabric: fabRow.fabric,
       invFabricId: fabRow.invId,
       invFabricUsed: fabRow.invQty,
-      price: Math.round(fabRow.price || 0),
-      garment: fabRow.garment || '',
-      stitchType: fabRow.stitchType || ''
+      price: Math.round(fabRow.price || 0)
     });
   }
 
@@ -6872,7 +6834,7 @@ async function submitNewOrder() {
     status: 'pending',
     payStatus: document.getElementById('ao-pay').value,
     advance: Math.round(parseFloat(document.getElementById('ao-advance').value) || 0),
-    garment: fabRows[0]?.garment || '',
+    garment: document.getElementById('ao-garment').value,
     fabric: fabRows.map(r => r.fabric).filter(Boolean).join(', ') || '',
     design: (document.getElementById('ao-design')||{value:''}).value,
     images: pendingOrderImages.slice(0, 5),
@@ -6932,9 +6894,6 @@ async function submitNewOrder() {
     ? `Order added · ${fabRows.length} pieces · fabric deducted from inventory`
     : `Order added for ${c.name} · ${fabRows.length} pieces`;
   toast(msg, 'success');
-
-  // Open orders popup so user sees the updated order list
-  setTimeout(() => showOrdersPopup(addOrdUid), 120);
   } finally {
     _savingOrder=false;
     if(btn){btn.disabled=false;btn.textContent=editingOrdId?'✅ Update Order':'✅ Save Order';}
@@ -7568,6 +7527,10 @@ function showInv(uid, oid) {
   if (!o) { toast('No orders', 'error'); return; }
   window._lastInvOrder = o;
 
+  // ── Fetch stitch type from measurements ──
+  const meas = c.measurements || {};
+  const stitchType = meas.designType || '';
+
   const qty = o.orders || 1;
   const adv = o.advance || 0;
   const deliveryCharge = o.deliveryCharge || 0;
@@ -7578,8 +7541,8 @@ function showInv(uid, oid) {
     piecesData = o.pieces.map((piece, idx) => {
       const piecePrice = piece.price || 0;
       totalPrice += piecePrice;
-      return { number: idx + 1, garment: piece.garment || o.garment || '', fabric: piece.fabric || '',
-               stitchType: piece.stitchType || '',
+      return { number: idx + 1, garment: o.garment || '', fabric: piece.fabric || '',
+               stitchType: piece.stitchType || stitchType || '',
                meters: piece.invFabricUsed || piece.meters || '1', price: piecePrice };
     });
   } else {
@@ -7587,7 +7550,7 @@ function showInv(uid, oid) {
     totalPrice = o.price || 0;
     for (let i = 0; i < qty; i++) {
       piecesData.push({ number: i + 1, garment: o.garment || '', fabric: o.fabric || '',
-                        stitchType: '', meters: '1', price: pricePerPiece });
+                        stitchType: stitchType || '', meters: '1', price: pricePerPiece });
     }
   }
 
@@ -7710,8 +7673,8 @@ function _renderInvPaper() {
       <div>
         <div style="font-family:'Playfair Display',serif;font-size:22px;font-weight:700;color:#1A1916;line-height:1">${shopName}<sup style="font-size:10px;color:#C8A96E">®</sup></div>
         ${settings.tagline ? `<div style="font-size:9px;color:#9B9890;letter-spacing:.8px;text-transform:uppercase;margin-top:3px">${esc(settings.tagline)}</div>` : ''}
-        ${settings.phone ? `<div style="font-size:10.5px;color:#9B9890;margin-top:4px">${esc(settings.phone)}</div>` : ''}
-        ${settings.owner ? `<div style="font-size:10.5px;color:#9B9890">Owner: ${esc(settings.owner)}</div>` : ''}
+        ${settings.phone ? `<div style="font-size:10.5px;color:#6B6760;margin-top:4px">${esc(settings.phone)}</div>` : ''}
+        ${settings.owner ? `<div style="font-size:10.5px;color:#6B6760">Owner: ${esc(settings.owner)}</div>` : ''}
         ${settings.address ? `<div style="font-size:10px;color:#9B9890;margin-top:1px">${esc(settings.address)}</div>` : ''}
       </div>
     </div>
@@ -7727,8 +7690,8 @@ function _renderInvPaper() {
   <div style="background:#F9F7F4;border:1px solid #E8E4DC;border-radius:6px;padding:14px 18px;margin-bottom:20px">
     <div style="font-size:8.5px;font-weight:700;text-transform:uppercase;letter-spacing:1.2px;color:#9B9890;margin-bottom:8px">BILL TO</div>
     <div style="font-family:'Playfair Display',serif;font-size:16px;font-weight:500;color:#1A1916">${esc(c.name)}</div>
-    ${c.phone ? `<div style="font-size:11px;color:#6B6760;margin-top:4px"> ${esc(c.phone)}</div>` : ''}
-    ${c.address ? `<div style="font-size:11px;color:#6B6760;margin-top:2px"> ${esc(c.address)}</div>` : ''}
+    ${c.phone ? `<div style="font-size:11px;color:#6B6760;margin-top:4px">📞 ${esc(c.phone)}</div>` : ''}
+    ${c.address ? `<div style="font-size:11px;color:#6B6760;margin-top:2px">📍 ${esc(c.address)}</div>` : ''}
   </div>
 
   <!-- ITEMS TABLE -->
@@ -9549,274 +9512,5 @@ function copyAddressToClipboardLegacy(uid) {
 }
 
 </script>
-<!-- ══ ORDERS POPUP OVERLAY ══ -->
-<div id="orders-popup-overlay" style="position:fixed;inset:0;z-index:9500;background:rgba(0,0,0,0);backdrop-filter:blur(0px);display:flex;align-items:center;justify-content:center;visibility:hidden;pointer-events:none;transition:background 0.28s ease,backdrop-filter 0.28s ease;" onclick="if(event.target===this)closeOrdersPopup()">
-  <div id="orders-popup-modal" style="background:var(--warm-white);border-radius:20px;box-shadow:0 24px 80px rgba(0,0,0,0.35);width:min(940px,97vw);height:88vh;display:flex;flex-direction:column;overflow:hidden;transform:scale(0.88) translateY(32px);opacity:0;transition:transform 0.32s cubic-bezier(.34,1.45,.64,1),opacity 0.26s ease;">
-    <!-- Header -->
-    <div id="orders-popup-header" style="flex-shrink:0;background:linear-gradient(135deg,var(--charcoal) 0%,#2a2823 100%);padding:18px 24px 16px;position:relative;">
-      <div style="position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,#3B82F6,#8B5CF6,var(--gold));border-radius:20px 20px 0 0;"></div>
-      <div style="display:flex;align-items:center;justify-content:space-between;gap:14px;">
-        <div style="display:flex;align-items:center;gap:12px;">
-          <div id="orders-popup-avatar" style="width:44px;height:44px;border-radius:14px;background:linear-gradient(135deg,var(--accent),var(--gold));display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:700;color:var(--charcoal);flex-shrink:0;"></div>
-          <div>
-            <div id="orders-popup-name" style="font-family:'Playfair Display',serif;font-size:18px;font-weight:600;color:#FAF8F5;line-height:1.2;"></div>
-            <div id="orders-popup-meta" style="font-size:11px;color:rgba(255,255,255,0.45);margin-top:2px;"></div>
-          </div>
-        </div>
-        <div style="display:flex;align-items:center;gap:8px;flex-shrink:0;">
-          <button onclick="openAddOrdFromPopup()" style="display:flex;align-items:center;gap:6px;background:var(--gold);color:var(--charcoal);border:none;border-radius:10px;padding:8px 16px;font-size:12px;font-weight:700;cursor:pointer;font-family:'DM Sans',sans-serif;transition:all .15s;" onmouseover="this.style.background='#e8c060'" onmouseout="this.style.background='var(--gold)'">
-            <span style="font-size:14px">+</span> New Order
-          </button>
-          <button onclick="closeOrdersPopup()" style="width:34px;height:34px;border-radius:50%;background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.15);color:#FAF8F5;font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .15s;" onmouseover="this.style.background='rgba(255,255,255,0.2)'" onmouseout="this.style.background='rgba(255,255,255,0.1)'">✕</button>
-        </div>
-      </div>
-    </div>
-    <!-- Column Headers -->
-    <div style="flex-shrink:0;background:var(--ivory);border-bottom:2px solid var(--border);padding:0 16px;">
-      <div class="op-row-grid" style="padding:8px 10px;">
-        <span style="font-size:9px;text-transform:uppercase;letter-spacing:.9px;color:var(--light-muted);font-weight:600;">#Order</span>
-        <span style="font-size:9px;text-transform:uppercase;letter-spacing:.9px;color:var(--light-muted);font-weight:600;">Amount</span>
-        <span style="font-size:9px;text-transform:uppercase;letter-spacing:.9px;color:var(--light-muted);font-weight:600;">Details</span>
-        <span style="font-size:9px;text-transform:uppercase;letter-spacing:.9px;color:var(--light-muted);font-weight:600;">Pay Badge</span>
-        <span style="font-size:9px;text-transform:uppercase;letter-spacing:.9px;color:var(--light-muted);font-weight:600;">Method</span>
-        <span style="font-size:9px;text-transform:uppercase;letter-spacing:.9px;color:var(--light-muted);font-weight:600;">Status</span>
-        <span style="font-size:9px;text-transform:uppercase;letter-spacing:.9px;color:var(--light-muted);font-weight:600;">Pay Status</span>
-        <span style="font-size:9px;text-transform:uppercase;letter-spacing:.9px;color:var(--light-muted);font-weight:600;">Pay Method</span>
-        <span style="font-size:9px;text-transform:uppercase;letter-spacing:.9px;color:var(--light-muted);font-weight:600;">Actions</span>
-      </div>
-    </div>
-    <!-- Scrollable Body — takes all remaining height -->
-    <div id="orders-popup-body" style="flex:1;min-height:0;overflow-y:auto;padding:10px 16px 20px;"></div>
-  </div>
-</div>
-
-<style>
-/* shared grid for header row and each order row */
-.op-row-grid{
-  display:grid;
-  grid-template-columns:100px 100px 1fr 82px 86px 92px 90px 90px 136px;
-  gap:6px;
-  align-items:center;
-}
-#orders-popup-overlay.pop-open{visibility:visible!important;pointer-events:auto!important;background:rgba(0,0,0,0.55)!important;backdrop-filter:blur(3px)!important;}
-#orders-popup-overlay.pop-open #orders-popup-modal{transform:scale(1) translateY(0)!important;opacity:1!important;}
-.op-row{
-  padding:9px 10px;
-  background:var(--warm-white);
-  border:1px solid var(--border);
-  border-radius:10px;
-  margin-bottom:7px;
-  transition:box-shadow .12s, border-color .12s;
-}
-.op-row:hover{box-shadow:0 2px 12px rgba(0,0,0,0.08);border-color:var(--border-strong);}
-.op-row.ov-row{border-color:#F0BBBB;background:#FBEAEA;}
-.op-row.ov-row:hover{box-shadow:0 2px 12px rgba(196,68,68,0.12);}
-.op-id{font-size:9.5px;font-family:'Courier New',monospace;color:var(--light-muted);}
-.op-amt{font-size:12px;font-weight:600;color:var(--charcoal);}
-.op-det{font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.op-actions{display:flex;gap:2px;align-items:center;flex-wrap:nowrap;}
-</style>
-
-<script>
-let _ordersPopupUid = null;
-
-function showOrdersPopup(uid) {
-  _ordersPopupUid = uid;
-  const c = clients.find(x => x.uid === uid);
-  if (!c) return;
-  _updateOrdersPopupHeader(c);
-  _renderOrdersPopupBody(c);
-  const overlay = document.getElementById('orders-popup-overlay');
-  // overlay is always in DOM (visibility:hidden) so transitions fire immediately
-  // Small timeout lets the browser register the initial state before animating
-  setTimeout(() => overlay.classList.add('pop-open'), 10);
-}
-
-function _updateOrdersPopupHeader(c) {
-  const ol = c.orderList || [];
-  const initials = c.name.trim().split(/\s+/).map(w => w[0]).join('').toUpperCase().slice(0,2);
-  document.getElementById('orders-popup-avatar').textContent = initials;
-  document.getElementById('orders-popup-name').textContent = c.name;
-  const pending = ol.filter(o => o.status === 'pending').length;
-  const overdue = ol.filter(o => isOv(o)).length;
-  document.getElementById('orders-popup-meta').textContent =
-    `${ol.length} order${ol.length !== 1 ? 's' : ''} · ${pending} pending` +
-    (overdue ? ` · ⚠ ${overdue} overdue` : '') +
-    (c.phone ? ` · ${c.phone}` : '');
-}
-
-function closeOrdersPopup() {
-  const overlay = document.getElementById('orders-popup-overlay');
-  overlay.classList.remove('pop-open');
-  // Only null the uid after the close animation finishes
-  setTimeout(() => { _ordersPopupUid = null; }, 320);
-}
-
-function openAddOrdFromPopup() {
-  if (!_ordersPopupUid) return;
-  const uid = _ordersPopupUid; // capture BEFORE closeOrdersPopup nulls it
-  closeOrdersPopup();
-  setTimeout(() => openAddOrd(uid), 260);
-}
-
-function _renderOrdersPopupBody(c) {
-  const ol = c.orderList || [];
-  const body = document.getElementById('orders-popup-body');
-  if (!body) return;
-
-  if (!ol.length) {
-    body.innerHTML = `<div style="text-align:center;padding:80px 20px;color:var(--light-muted);">
-      <div style="font-size:40px;opacity:.2;margin-bottom:12px;">📋</div>
-      <div style="font-family:'Playfair Display',serif;font-size:15px;color:var(--muted);">No orders yet</div>
-      <div style="font-size:12px;margin-top:6px;">Click <strong>+ New Order</strong> to add the first one.</div>
-    </div>`;
-    return;
-  }
-
-  body.innerHTML = ol.map((o, i) => {
-    const ov = isOv(o);
-    const np = netPrice(o);
-    const pm = o.paymentMethod || 'cash';
-    const pieces = o.pieces && o.pieces.length
-      ? o.pieces.map(p => [p.garment, p.fabric].filter(Boolean).join(' · ')).join(' | ')
-      : (o.garment || '') + (o.fabric ? ' · ' + o.fabric : '');
-    const detailText = [pieces || '—', o.delivery ? 'Del:' + o.delivery : ''].filter(Boolean).join(' · ') + (ov ? ' ⚠ OVERDUE' : '');
-
-    return `<div class="op-row${ov ? ' ov-row' : ''}">
-      <div class="op-row-grid">
-        <div>
-          <div class="op-id">#${i+1}·${o.id}</div>
-          <div style="font-size:9px;color:var(--light-muted);margin-top:1px;">${o.addedDate||''}</div>
-        </div>
-        <div class="op-amt">
-          Rs ${np.toLocaleString()}
-          ${o.discount ? `<div style="font-size:9px;color:var(--success);font-weight:400;">-${o.discount} disc</div>` : ''}
-        </div>
-        <div class="op-det" title="${esc(detailText)}">${esc(detailText)}</div>
-        <div>${payBadge(o.payStatus||'unpaid')}</div>
-        <div>
-          <span style="display:inline-flex;align-items:center;gap:3px;padding:2px 7px;border-radius:20px;font-size:9.5px;font-weight:500;white-space:nowrap;background:${pm==='cash'?'var(--success-bg)':'var(--info-bg)'};color:${pm==='cash'?'var(--success)':'var(--info)'};border:1px solid ${pm==='cash'?'var(--success-border)':'var(--info-border)'};">${pm==='cash'?'💵 Cash':'💳 Online'}</span>
-        </div>
-        <div>
-          <select class="ssel" onchange="popChgStatus('${c.uid}','${o.id}',this.value)" style="font-size:10px;padding:3px 5px;width:86px;border-color:${o.status==='completed'?'var(--success)':ov?'#C44':'var(--warning)'}">
-            <option value="pending" ${o.status==='pending'?'selected':''}>Pending</option>
-            <option value="completed" ${o.status==='completed'?'selected':''}>Completed</option>
-            <option value="cancelled" ${o.status==='cancelled'?'selected':''}>Cancelled</option>
-          </select>
-        </div>
-        <div>
-          <select class="ssel" onchange="popChgPay('${c.uid}','${o.id}',this.value)" style="font-size:10px;padding:3px 5px;width:84px;">
-            <option value="unpaid" ${(o.payStatus||'unpaid')==='unpaid'?'selected':''}>Unpaid</option>
-            <option value="partial" ${(o.payStatus||'')==='partial'?'selected':''}>Partial</option>
-            <option value="paid" ${(o.payStatus||'')==='paid'?'selected':''}>Paid</option>
-          </select>
-        </div>
-        <div>
-          <select class="ssel" onchange="popChgPayMethod('${c.uid}','${o.id}',this.value)" style="font-size:10px;padding:3px 5px;width:84px;background:${pm==='cash'?'var(--success-bg)':'var(--info-bg)'};">
-            <option value="cash" ${pm==='cash'?'selected':''}>💵 Cash</option>
-            <option value="online" ${pm==='online'?'selected':''}>💳 Online</option>
-          </select>
-        </div>
-        <div class="op-actions">
-          <button class="act wa" onclick="sendWAOrder('${c.uid}','${o.id}')" title="WhatsApp">${WA_ICON}</button>
-          <button class="act iv" onclick="showInv('${c.uid}','${o.id}')" title="Invoice">🧾</button>
-          <button class="act tk" onclick="showToken('${c.uid}','${o.id}')" title="Token">🎫</button>
-          <button class="act ed" onclick="popEditOrd('${c.uid}','${o.id}')" title="Edit">✏</button>
-          <button class="act dl" onclick="popDelOrd('${c.uid}','${o.id}')" title="Delete">🗑</button>
-          ${o.images&&o.images.length?`<button class="act" style="color:var(--accent)" onclick="viewOrderImages('${c.uid}','${o.id}')" title="${o.images.length} photo(s)">🖼</button>`:''}
-        </div>
-      </div>
-    </div>`;
-  }).join('');
-}
-
-// ── Popup change handlers ─────────────────────────────────────────────────────
-// These update the data model and save — WITHOUT touching expandedRows or
-// _pinnedClients, so the background booking table stays collapsed and clean.
-// A lightweight _scheduleRender() (no uid) runs so stats/badges update,
-// but because expandedRows does NOT contain this uid the row stays closed.
-
-function _popSaveAndRefresh(uid) {
-  _invalidateStats();
-  // Schedule a full render but do NOT add uid to expandedRows — row stays closed
-  if (_renderTimer) clearTimeout(_renderTimer);
-  _renderTimer = setTimeout(() => {
-    _renderTimer = null;
-    try { renderBooking(); } catch(e) {}
-    try { updateHome(); } catch(e) {}
-    try { updateBadges(); } catch(e) {}
-  }, 60);
-  // Refresh popup immediately
-  const c = clients.find(x => x.uid === uid);
-  if (c && _ordersPopupUid === uid) {
-    _updateOrdersPopupHeader(c);
-    _renderOrdersPopupBody(c);
-  }
-}
-
-function popChgStatus(uid, oid, val) {
-  const c = clients.find(x => x.uid === uid); if (!c) return;
-  const o = (c.orderList||[]).find(x => x.id === oid); if (!o) return;
-  const old = o.status;
-  o.status = val;
-  saveOrderFast(uid, o);
-  _popSaveAndRefresh(uid);
-  toast(`Status changed from ${old} to ${val}`, val === 'completed' ? 'success' : val === 'cancelled' ? 'error' : 'default');
-}
-
-function popChgPay(uid, oid, val) {
-  const c = clients.find(x => x.uid === uid); if (!c) return;
-  const o = (c.orderList||[]).find(x => x.id === oid); if (!o) return;
-  const old = o.payStatus || 'unpaid';
-  o.payStatus = val;
-  if (val === 'paid' || val === 'partial') { if (!o.paidDate) o.paidDate = localDate(); }
-  else { o.paidDate = null; }
-  saveOrderFast(uid, o);
-  _popSaveAndRefresh(uid);
-  toast(`Payment status changed from ${old} to ${val}`, 'success');
-}
-
-function popChgPayMethod(uid, oid, val) {
-  const c = clients.find(x => x.uid === uid); if (!c) return;
-  const o = (c.orderList||[]).find(x => x.id === oid); if (!o) return;
-  const old = o.paymentMethod || 'cash';
-  o.paymentMethod = val;
-  saveOrderFast(uid, o);
-  _popSaveAndRefresh(uid);
-  toast(`Payment method changed from ${old==='cash'?'Cash':'Online'} to ${val==='cash'?'Cash':'Online'} for order ${oid}`, 'success');
-}
-
-function popEditOrd(uid, oid) {
-  closeOrdersPopup();
-  setTimeout(() => openEditOrd(uid, oid), 230);
-}
-
-function popDelOrd(uid, oid) {
-  const c = clients.find(x => x.uid === uid); if (!c) return;
-  if (!confirm(`Delete order ${oid} for ${c.name}?`)) return;
-  const ord = (c.orderList||[]).find(x => x.id === oid);
-  // Restore inventory
-  if (ord && ord.invFabricId && ord.invFabricUsed > 0) {
-    const item = inventory.find(x => x.id === ord.invFabricId);
-    if (item) {
-      item.qty = parseFloat((item.qty + ord.invFabricUsed).toFixed(2));
-      invHistory.push({date:localDate(),item:item.name,category:item.category,change:ord.invFabricUsed,unit:item.unit,note:`Restored — order ${oid} deleted (${c.name})`});
-      if (invHistory.length > 500) invHistory = invHistory.slice(-500);
-    }
-  }
-  if (ord && ord.images && ord.images.length && window.electronAPI) {
-    window.electronAPI.invoke('DELETE_IMAGES', ord.images).catch(()=>{});
-  }
-  const invData = (ord && ord.invFabricId && ord.invFabricUsed > 0 && inventory.find(x=>x.id===ord.invFabricId))
-    ? {invFabricId:ord.invFabricId,invFabricUsed:ord.invFabricUsed,invItemName:inventory.find(x=>x.id===ord.invFabricId)?.name,invCategory:inventory.find(x=>x.id===ord.invFabricId)?.category,invUnit:inventory.find(x=>x.id===ord.invFabricId)?.unit}
-    : {};
-  c.orderList = (c.orderList||[]).filter(x => x.id !== oid);
-  pushUndo('order', {uid, order:ord, ...invData}, `Order ${oid} deleted`);
-  saveSync();
-  _popSaveAndRefresh(uid);
-  toast(`Order ${oid} deleted`, 'default');
-}
-</script>
-
 </body>
 </html>
