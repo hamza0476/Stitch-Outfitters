@@ -4,16 +4,16 @@ const path  = require('path')
 const fs    = require('fs')
 const { app, dialog, shell } = require('electron')
 const { state: paths, ensureDirs } = require('./paths')
-const { doBackup } = require('./backup')
+const { doBackup, getBackupStatus, verifyAllBackups, clearHistory, setWinRef: setBackupWinRef, loadStatus } = require('./backup')
 
 let db = null
 let _stmts = null
 let winRef = null
 let _backupDone = false
 
-const MAX_IMAGE_B64_LEN = 8 * 1024 * 1024
+const MAX_IMAGE_B64_LEN = 25 * 1024 * 1024
 
-function setWinRef (w) { winRef = w }
+function setWinRef (w) { winRef = w; setBackupWinRef(w) }
 function isOpen () { return !!db }
 function backupDone () { return _backupDone }
 function setBackupDone (v) { _backupDone = v }
@@ -125,12 +125,14 @@ function openDB () {
 
   db = new Database(paths.dbFile, { timeout: 5000, verbose: null })
 
-  db.pragma('journal_mode = DELETE')
+  db.pragma('journal_mode = WAL')
   db.pragma('foreign_keys = ON')
   db.pragma('cache_size = -32768')
   db.pragma('synchronous = FULL')
   db.pragma('temp_store = MEMORY')
   db.pragma('mmap_size = 268435456')
+
+  loadStatus().catch(() => {})
 
   try {
     const oldWorkers = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='workers_old'").get()
@@ -169,13 +171,13 @@ function openDB () {
     CREATE TABLE IF NOT EXISTS orders (
       id              TEXT PRIMARY KEY,
       client_uid      TEXT NOT NULL REFERENCES clients(uid) ON DELETE CASCADE,
-      orders          INTEGER DEFAULT 1,
-      price           REAL DEFAULT 0,
-      discount        REAL DEFAULT 0,
+      orders          INTEGER DEFAULT 1 CHECK (orders >= 1),
+      price           REAL DEFAULT 0 CHECK (price >= 0),
+      discount        REAL DEFAULT 0 CHECK (discount >= 0),
       delivery        TEXT DEFAULT '',
       status          TEXT DEFAULT 'pending',
       pay_status      TEXT DEFAULT 'unpaid',
-      advance         REAL DEFAULT 0,
+      advance         REAL DEFAULT 0 CHECK (advance >= 0),
       paid_date       TEXT DEFAULT NULL,
       garment         TEXT DEFAULT '',
       fabric          TEXT DEFAULT '',
@@ -205,6 +207,25 @@ function openDB () {
       comm_c INTEGER DEFAULT 1
     );
     INSERT OR IGNORE INTO counters (id) VALUES (1);
+    CREATE TABLE IF NOT EXISTS wa_message_queue (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      invoice_id       TEXT,
+      customer_id      TEXT,
+      phone_original   TEXT NOT NULL DEFAULT '',
+      phone_normalized TEXT NOT NULL DEFAULT '',
+      message          TEXT NOT NULL DEFAULT '',
+      image_base64     TEXT,
+      mime             TEXT DEFAULT 'image/jpeg',
+      status           TEXT NOT NULL DEFAULT 'PENDING',
+      attempts         INTEGER NOT NULL DEFAULT 0,
+      max_attempts     INTEGER NOT NULL DEFAULT 3,
+      last_error       TEXT,
+      created_at       TEXT NOT NULL DEFAULT '',
+      sent_at          TEXT,
+      next_retry_at    TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_wamq_status          ON wa_message_queue(status);
+    CREATE INDEX IF NOT EXISTS idx_wamq_next_retry      ON wa_message_queue(next_retry_at);
     CREATE INDEX IF NOT EXISTS idx_orders_client_uid       ON orders(client_uid);
     CREATE INDEX IF NOT EXISTS idx_orders_status           ON orders(status);
     CREATE INDEX IF NOT EXISTS idx_orders_pay_status       ON orders(pay_status);
@@ -243,14 +264,20 @@ function readData () {
     })
   }
 
-  const clients = db.prepare('SELECT * FROM clients ORDER BY rowid').all().map(c => ({
-    uid: c.uid, name: c.name, phone: c.phone, email: c.email,
-    age: c.age, city: c.city, address: c.address, tag: c.tag,
-    addedDate: c.added_date,
-    measurements: c.measurements ? safeJSON(c.measurements, null) : undefined,
-    orderList: ordersByClient[c.uid] || [],
-    ...safeJSON(c.extra, {})
-  }))
+  const clients = db.prepare('SELECT * FROM clients ORDER BY rowid').all().map(c => {
+    const extra = safeJSON(c.extra, {})
+    // Default country to PK (Pakistan) for legacy clients without country field
+    const country = extra.country || 'PK'
+    return {
+      uid: c.uid, name: c.name, phone: c.phone, email: c.email,
+      age: c.age, city: c.city, address: c.address, tag: c.tag,
+      addedDate: c.added_date,
+      country,
+      measurements: c.measurements ? safeJSON(c.measurements, null) : undefined,
+      orderList: ordersByClient[c.uid] || [],
+      ...extra
+    }
+  })
 
   const settings = {}
   for (const s of db.prepare('SELECT key,value FROM settings').all()) {
@@ -260,13 +287,19 @@ function readData () {
   const ctr = db.prepare('SELECT * FROM counters WHERE id=1').get() || {}
   return {
     clients,
-    workers:        db.prepare('SELECT data FROM workers ORDER BY rowid').all().map(r => safeJSON(r.data, {})),
-    assignments:    db.prepare('SELECT data FROM assignments ORDER BY rowid').all().map(r => safeJSON(r.data, {})),
-    expenses:       db.prepare('SELECT data FROM expenses ORDER BY rowid').all().map(r => safeJSON(r.data, {})),
-    inventory:      db.prepare('SELECT data FROM inventory ORDER BY rowid').all().map(r => safeJSON(r.data, {})),
-    invHistory:     db.prepare('SELECT data FROM inv_history ORDER BY id').all().map(r => safeJSON(r.data, {})),
-    salaryPayments: db.prepare('SELECT data FROM salary_payments ORDER BY rowid').all().map(r => safeJSON(r.data, {})),
-    commissionLogs: db.prepare('SELECT data FROM commission_logs ORDER BY rowid').all().map(r => safeJSON(r.data, {})),
+    // NOTE: workers/assignments/expenses/inventory/invHistory/salaryPayments/
+    // commissionLogs are intentionally NOT loaded here — they're fetched
+    // separately via LOAD_BLOB_TABLES for faster startup. These are stub
+    // placeholders only. `_blobPending: true` tells the renderer this is a
+    // core-only payload so it never overwrites real blob data already in memory.
+    workers:        [],
+    assignments:    [],
+    expenses:       [],
+    inventory:      [],
+    invHistory:     [],
+    salaryPayments: [],
+    commissionLogs: [],
+    _blobPending: true,
     settings,
     uidC:  ctr.uid_c  || 1000,
     ordC:  ctr.ord_c  || 1,
@@ -277,6 +310,22 @@ function readData () {
     salC:  ctr.sal_c  || 1,
     commC: ctr.comm_c || 1
   }
+}
+
+// ── Read blob tables only (lazy-loaded after startup) ──────────────
+function readBlobData () {
+  if (!db) return null
+  try {
+    return {
+      workers:        db.prepare('SELECT data FROM workers ORDER BY rowid').all().map(r => safeJSON(r.data, {})),
+      assignments:    db.prepare('SELECT data FROM assignments ORDER BY rowid').all().map(r => safeJSON(r.data, {})),
+      expenses:       db.prepare('SELECT data FROM expenses ORDER BY rowid').all().map(r => safeJSON(r.data, {})),
+      inventory:      db.prepare('SELECT data FROM inventory ORDER BY rowid').all().map(r => safeJSON(r.data, {})),
+      invHistory:     db.prepare('SELECT data FROM inv_history ORDER BY id DESC LIMIT 500').all().map(r => safeJSON(r.data, {})).reverse(),
+      salaryPayments: db.prepare('SELECT data FROM salary_payments ORDER BY rowid').all().map(r => safeJSON(r.data, {})),
+      commissionLogs: db.prepare('SELECT data FROM commission_logs ORDER BY rowid').all().map(r => safeJSON(r.data, {})),
+    }
+  } catch (e) { console.error('[SO] readBlobData error:', e.message); return null }
 }
 
 // ── Write ────────────────────────────────────────────────────────────
@@ -342,6 +391,22 @@ function writeData (data) {
       }
     }
 
+    const existingClients = selClients.all()
+    const existingOrders  = selOrders.all()
+
+    // [DATA-LOSS-GUARD] Never allow a save that would mass-delete ALL clients
+    // or ALL orders. This prevents catastrophic data loss when the renderer
+    // sends empty arrays (e.g., during startup race conditions, crash recovery,
+    // or beforeunload firing before load() completes).
+    if (cUids.size === 0 && existingClients.length > 0) {
+      console.error('[SO] SAFETY: writeData received 0 clients but DB has', existingClients.length, '— refusing to delete')
+      throw new Error('Data safety check failed: refusing to delete all clients')
+    }
+    if (oIds.size === 0 && existingOrders.length > 0) {
+      console.error('[SO] SAFETY: writeData received 0 orders but DB has', existingOrders.length, '— refusing to delete')
+      throw new Error('Data safety check failed: refusing to delete all orders')
+    }
+
     const _bulkDelete = (stmt_prefix, existingRows, keepSet) => {
       const toDelete = existingRows.filter(r => {
         const key = r.uid || r.id
@@ -356,8 +421,16 @@ function writeData (data) {
       }
     }
 
-    _bulkDelete('DELETE FROM clients WHERE uid IN', selClients.all(), cUids)
-    _bulkDelete('DELETE FROM orders WHERE id IN',   selOrders.all(),  oIds)
+    // [BACKUP-BEFORE-DELETE] Trigger a backup before any destructive writes
+    const orphanClients = existingClients.filter(r => !cUids.has(r.uid))
+    const orphanOrders  = existingOrders.filter(r => !oIds.has(r.id))
+    if (orphanClients.length > 0 || orphanOrders.length > 0) {
+      console.warn(`[SO] writeData: about to delete ${orphanClients.length} clients and ${orphanOrders.length} orphan orders`)
+      setImmediate(() => { doBackup(db) })
+    }
+
+    _bulkDelete('DELETE FROM clients WHERE uid IN', existingClients, cUids)
+    _bulkDelete('DELETE FROM orders WHERE id IN',   existingOrders,  oIds)
 
     const blobTables = [
       ['workers',         'workers',         data.workers||[]],
@@ -367,28 +440,44 @@ function writeData (data) {
       ['salary_payments', 'salary_payments', data.salaryPayments||[]],
       ['commission_logs', 'commission_logs', data.commissionLogs||[]],
     ]
-    for (const [tbl, stmtKey, rows] of blobTables) {
-      const ins = uBlob[stmtKey]
-      const keepIds = new Set()
-      for (const r of rows) {
-        const id = r.id || rand()
-        keepIds.add(id)
-        ins.run(id, JSON.stringify(r))
-      }
-      if (keepIds.size === 0) {
-        db.prepare(`DELETE FROM ${tbl}`).run()
-      } else {
-        const existingIds = db.prepare(`SELECT id FROM ${tbl}`).all().map(r => r.id)
-        const orphans = existingIds.filter(id => !keepIds.has(id))
-        for (let i = 0; i < orphans.length; i += 900) {
-          const chunk = orphans.slice(i, i + 900)
-          if (!chunk.length) break
-          const ph = chunk.map(() => '?').join(',')
-          db.prepare(`DELETE FROM ${tbl} WHERE id IN (${ph})`).run(...chunk)
+    // [BUGFIX / DATA-LOSS GUARD] workers/assignments/expenses/inventory/
+    // salaryPayments/commissionLogs are loaded lazily in the renderer via a
+    // separate LOAD_BLOB_TABLES call. If a full SAVE arrives before that call
+    // has resolved, the renderer's in-memory arrays for those tables are just
+    // empty placeholders — NOT a real "user deleted everything" state. Treating
+    // that as real would wipe every worker/inventory/etc. row via the
+    // "keepIds.size === 0 → DELETE FROM table" path below. The renderer marks
+    // such payloads with `_skipBlobSync`; when present, leave these tables
+    // completely untouched for this save (clients/orders/settings/counters
+    // still save normally).
+    if (!data._skipBlobSync) {
+      for (const [tbl, stmtKey, rows] of blobTables) {
+        const ins = uBlob[stmtKey]
+        const keepIds = new Set()
+        for (const r of rows) {
+          const id = r.id || rand()
+          keepIds.add(id)
+          ins.run(id, JSON.stringify(r))
+        }
+        if (keepIds.size === 0) {
+          db.prepare(`DELETE FROM ${tbl}`).run()
+        } else {
+          const existingIds = db.prepare(`SELECT id FROM ${tbl}`).all().map(r => r.id)
+          const orphans = existingIds.filter(id => !keepIds.has(id))
+          for (let i = 0; i < orphans.length; i += 900) {
+            const chunk = orphans.slice(i, i + 900)
+            if (!chunk.length) break
+            const ph = chunk.map(() => '?').join(',')
+            db.prepare(`DELETE FROM ${tbl} WHERE id IN (${ph})`).run(...chunk)
+          }
         }
       }
+    } else {
+      console.log('[SO] writeData: skipped blob-table sync (renderer blob data not loaded yet) — workers/inventory/etc left untouched')
     }
 
+    // invHistory: cap at 500 rows (DB-side enforcement)
+    const MAX_INV_HISTORY = 500
     const existingH = db.prepare('SELECT COUNT(*) as n FROM inv_history').get().n
     const inH = data.invHistory || []
     if (inH.length > existingH) {
@@ -396,6 +485,11 @@ function writeData (data) {
     } else if (inH.length < existingH) {
       db.prepare('DELETE FROM inv_history').run()
       for (const h of inH) iIH.run(JSON.stringify(h))
+    }
+    // Enforce cap: keep only the latest MAX_INV_HISTORY rows
+    const totalH = db.prepare('SELECT COUNT(*) as n FROM inv_history').get().n
+    if (totalH > MAX_INV_HISTORY) {
+      db.prepare(`DELETE FROM inv_history WHERE id NOT IN (SELECT id FROM inv_history ORDER BY id DESC LIMIT ${MAX_INV_HISTORY})`).run()
     }
 
     if (data.settings) {
@@ -526,30 +620,10 @@ function saveWorker (worker, deletedId) {
     if (deletedId) {
       db.transaction(() => {
         db.prepare('DELETE FROM workers WHERE id = ?').run(deletedId)
-        const aIds = db.prepare('SELECT id, data FROM assignments').all()
-          .filter(r => { try { return JSON.parse(r.data).workerId === deletedId } catch (_) { return false } })
-          .map(r => r.id)
-        for (let i = 0; i < aIds.length; i += 900) {
-          const chunk = aIds.slice(i, i + 900)
-          if (!chunk.length) break
-          db.prepare(`DELETE FROM assignments WHERE id IN (${chunk.map(() => '?').join(',')})`).run(...chunk)
-        }
-        const sIds = db.prepare('SELECT id, data FROM salary_payments').all()
-          .filter(r => { try { return JSON.parse(r.data).workerId === deletedId } catch (_) { return false } })
-          .map(r => r.id)
-        for (let i = 0; i < sIds.length; i += 900) {
-          const chunk = sIds.slice(i, i + 900)
-          if (!chunk.length) break
-          db.prepare(`DELETE FROM salary_payments WHERE id IN (${chunk.map(() => '?').join(',')})`).run(...chunk)
-        }
-        const cIds = db.prepare('SELECT id, data FROM commission_logs').all()
-          .filter(r => { try { return JSON.parse(r.data).workerId === deletedId } catch (_) { return false } })
-          .map(r => r.id)
-        for (let i = 0; i < cIds.length; i += 900) {
-          const chunk = cIds.slice(i, i + 900)
-          if (!chunk.length) break
-          db.prepare(`DELETE FROM commission_logs WHERE id IN (${chunk.map(() => '?').join(',')})`).run(...chunk)
-        }
+        // Use json_extract() for SQL-level filtering — avoids loading all rows into JS
+        db.prepare("DELETE FROM assignments WHERE json_extract(data,'$.workerId') = ?").run(deletedId)
+        db.prepare("DELETE FROM salary_payments WHERE json_extract(data,'$.workerId') = ?").run(deletedId)
+        db.prepare("DELETE FROM commission_logs WHERE json_extract(data,'$.workerId') = ?").run(deletedId)
       })()
       return { ok: true }
     }
@@ -601,6 +675,13 @@ function registerHandlers (ipcMain) {
     if (!db) return { ok: false, error: 'Database not open' }
     try { return writeData(data) }
     catch (err) { console.error('[SO] SAVE error:', err.message); return { ok: false, error: err.message } }
+  })
+
+  // Synchronous SAVE — used by beforeunload to guarantee data is written before window closes
+  ipcMain.on('SAVE_SYNC', (e, data) => {
+    if (!db) { e.returnValue = { ok: false, error: 'Database not open' }; return }
+    try { e.returnValue = writeData(data) }
+    catch (err) { console.error('[SO] SAVE_SYNC error:', err.message); e.returnValue = { ok: false, error: err.message } }
   })
 
   ipcMain.handle('SAVE_IMAGES', (e, { orderId, images }) => {
@@ -686,8 +767,20 @@ function registerHandlers (ipcMain) {
     return saveCommLog(log, deletedId)
   })
 
-  ipcMain.handle('DO_BACKUP', () => {
-    doBackup(db)
+  ipcMain.handle('DO_BACKUP', async () => {
+    return await doBackup(db)
+  })
+
+  ipcMain.handle('GET_BACKUP_STATUS', () => {
+    return getBackupStatus()
+  })
+
+  ipcMain.handle('VERIFY_BACKUPS', async (e, onProgress) => {
+    return await verifyAllBackups()
+  })
+
+  ipcMain.handle('CLEAR_BACKUP_HISTORY', async () => {
+    await clearHistory()
     return { ok: true }
   })
 
@@ -739,7 +832,16 @@ function registerHandlers (ipcMain) {
           return { ok: false, error: `Copy failed: ${copyErr.message}` }
         }
 
-        try { openDB(); return { ok: true } } catch (openErr) {
+        try {
+          openDB()
+          // Verify restored DB integrity
+          const check = db.pragma('quick_check', { simple: true })
+          if (check !== 'ok') {
+            try { db.close() } catch (_) {}; db = null; _stmts = null
+            return { ok: false, error: `Database integrity check failed: ${check}` }
+          }
+          return { ok: true }
+        } catch (openErr) {
           return { ok: false, error: `Restore succeeded but DB re-open failed: ${openErr.message}` }
         }
       }
@@ -750,15 +852,34 @@ function registerHandlers (ipcMain) {
     }
   })
 
+  ipcMain.handle('CHECK_DATA_INTEGRITY', () => {
+    if (!db) return { ok: false, error: 'Database not open' }
+    try {
+      const clientCount = db.prepare('SELECT COUNT(*) as n FROM clients').get().n
+      const orderCount  = db.prepare('SELECT COUNT(*) as n FROM orders').get().n
+      const workerCount = db.prepare('SELECT COUNT(*) as n FROM workers').get().n
+      const dbSize = fs.existsSync(paths.dbFile) ? fs.statSync(paths.dbFile).size : 0
+      // DB is non-trivial (>10KB) but has no clients while having workers — likely data loss
+      const suspicious = dbSize > 10240 && clientCount === 0 && workerCount > 0
+      return { ok: true, clientCount, orderCount, workerCount, dbSize, suspicious }
+    } catch (e) { return { ok: false, error: e.message } }
+  })
+
   ipcMain.handle('READY', () => ({ ready: !!db }))
+
+  ipcMain.handle('LOAD_BLOB_TABLES', () => {
+    if (!db) return null
+    try { return readBlobData() }
+    catch (e) { console.error('[SO] LOAD_BLOB_TABLES error:', e.message); return null }
+  })
 }
 
-function triggerBackup () { doBackup(db) }
+function triggerBackup () { return doBackup(db) }
 
 module.exports = {
-  openDB, closeDB, readData, writeData, isOpen, triggerBackup,
+  openDB, closeDB, readData, readBlobData, writeData, isOpen, triggerBackup,
   saveClient, saveOrder, saveCounters,
   saveExpense, saveWorker, saveAssignment, saveSalaryPayment, saveCommLog,
-  registerHandlers, setWinRef,
-  backupDone, setBackupDone
+  registerHandlers, setWinRef, getDb: () => db,
+  backupDone, setBackupDone, getBackupStatus, verifyAllBackups, clearHistory
 }

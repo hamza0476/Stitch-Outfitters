@@ -12,8 +12,25 @@ const fs   = require('fs')
 
 const { state: paths, initPaths, ensureDirs, migrateDataFromDocuments } = require('./src/main/paths')
 const db = require('./src/main/database')
+const wa = require('./src/main/whatsapp')
 
 let win = null
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SINGLE-INSTANCE LOCK — prevent multiple instances from running simultaneously.
+// Two instances could overwrite each other's data via the orphan-deletion logic
+// in writeData(), causing silent data loss.
+// ══════════════════════════════════════════════════════════════════════════════
+const gotTheLock = app.requestSingleInstanceLock()
+if (!gotTheLock) {
+  app.quit()
+} else {
+  app.on('second-instance', () => {
+    if (win) {
+      if (win.isMinimized()) win.restore()
+      win.focus()
+    }
+  })
 
 // ══════════════════════════════════════════════════════════════════════════════
 // APP WINDOW
@@ -46,6 +63,11 @@ app.whenReady().then(() => {
 
   db.setWinRef(win)
   db.registerHandlers(ipcMain)
+
+  // ── WhatsApp automation (lazy — initialized on first use, not at startup) ──
+  wa.setWinRef(win)
+  wa.setDatabase(db.getDb())
+  wa.registerHandlers(ipcMain)
 
   // ── Path / storage info handlers ────────────────────────────────────
   ipcMain.handle('GET_PATH',         () => paths.dbFile   || '')
@@ -143,18 +165,27 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
 })
 
-app.on('before-quit', () => {
+app.on('before-quit', (e) => {
   if (!db.isOpen() || db.backupDone()) return
+  e.preventDefault()
   console.log('[SO] before-quit: backing up...')
-  db.triggerBackup()
-  db.setBackupDone(true)
+  db.triggerBackup().then(() => {
+    console.log('[SO] before-quit: backup done')
+    db.setBackupDone(true)
+    app.quit()
+  }).catch((err) => {
+    console.error('[SO] before-quit: backup failed:', err.message || err)
+    db.setBackupDone(true)
+    app.quit()
+  })
 })
 
 app.on('will-quit', () => {
   if (!db.isOpen()) return
   if (!db.backupDone()) {
-    console.log('[SO] will-quit: backing up...')
-    db.triggerBackup()
+    console.log('[SO] will-quit: backup not yet done — skipping')
   }
   db.closeDB()
 })
+
+} // end single-instance lock
