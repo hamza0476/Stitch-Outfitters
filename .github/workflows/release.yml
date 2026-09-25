@@ -29,7 +29,9 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: macos-13
+          # macos-13 was retired 2025-12-04; macos-15-intel is GitHub's
+          # Intel successor (supported until Aug 2027).
+          - os: macos-15-intel
             arch: x64
           - os: macos-14
             arch: arm64

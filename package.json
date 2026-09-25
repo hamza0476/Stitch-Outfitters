@@ -107,7 +107,8 @@
     "publish": {
       "provider": "github",
       "owner": "hamza0476",
-      "repo": "Stitch-Outfitters"
+      "repo": "Stitch-Outfitters",
+      "releaseType": "release"
     }
   },
   "dependencies": {
