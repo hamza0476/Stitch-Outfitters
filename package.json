@@ -11,7 +11,7 @@
     "build:portable": "electron-builder --win --x64 --portable",
     "build:mac": "electron-builder --mac --x64 --arm64",
     "build:all": "electron-builder --win --x64 --portable --mac --x64 --arm64",
-    "postinstall": "electron-builder install-app-deps",
+    "postinstall": "electron-builder install-app-deps && node scripts/patch-wwjs.js",
     "rebuild": "npx @electron/rebuild -f -w better-sqlite3 --electronVersion 33.4.0",
     "publish": "electron-builder --win --x64 --publish always"
   },

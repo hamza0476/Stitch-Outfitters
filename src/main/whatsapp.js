@@ -45,10 +45,13 @@ const MQ_STATUS = {
 
 // ── Timeouts (ms) ──────────────────────────────────────────────────────
 
-const INIT_TIMEOUT = 45000
-const SEND_TIMEOUT = 30000
+const INIT_TIMEOUT = 20000
+const SEND_TIMEOUT = 18000          // user-facing budget (soft recover kicks in after)
+const HEALTH_TIMEOUT = 3000
+const HEALTH_SKIP_MS = 10000        // skip getState if last healthy < 10s ago
+const PAGE_BUSY_MS = 15000          // after a timed-out send, hold the page this long
 const MAX_INIT_RETRIES = 3
-const RETRY_DELAYS_MS = [2000, 5000, 10000]
+const RETRY_DELAYS_MS = [1500, 3000, 6000]
 
 // ── Browser Discovery (Enhanced — 20+ paths, cross-platform, cached) ─────
 
@@ -215,21 +218,20 @@ function findBrowser () {
 
 /**
  * Get a browser for a specific retry attempt.
- * Attempt 0: cached path (bundled → system)
+ * Attempt 0: cached path (bundled → system) — NEVER resets the cache
+ *            (resetting caused up to 12s of sync PATH scans on every connect).
  * Attempt 1: force system Chrome (skip bundled)
  * Attempt 2: null (let Puppeteer use its own)
  */
 function getBrowserForAttempt (attempt) {
   if (attempt === 0) {
-    _browserCache.checked = false
-    _browserCache.path = null
+    // Use the pre-cached value if available; only scan if never scanned
+    if (_browserCache.checked) return _browserCache.path
     return findBrowser()
   }
   if (attempt === 1) {
-    // Skip bundled, try system browsers only
     return findChromeExecutable()
   }
-  // Attempt 2: let Puppeteer decide (no executablePath)
   return null
 }
 
@@ -237,24 +239,35 @@ function getBrowserForAttempt (attempt) {
 
 const state = {
   client: null,
+  clientGen: 0,              // generation token — events from old clients are ignored
   status: WA_STATE.DISCONNECTED,
   winRef: null,
   db: null,
   qrDataUrl: null,
   initTimer: null,
   connectionPromise: null,
+  reconnectLock: Promise.resolve(), // serializes destroy+connect outside connectionPromise
+  sendLock: Promise.resolve(),      // FIFO mutex: invoice send + queue never overlap
+  inflightSend: null,               // real evaluate promise still running after timeout
+  pageBusyUntil: 0,                 // Date.now() gate after a timed-out send
+  lastHealthyAt: 0,                 // last successful getState / send
   eventListenersAttached: false,
   queueRunning: false,
   sessionPath: null,
   webCachePath: null,
   retryAttempt: 0,
-  lastInitError: null
+  lastInitError: null,
+  readyPromise: null,
+  readyResolver: null
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 function setWinRef (win) { state.winRef = win }
-function setDatabase (db) { state.db = db }
+function setDatabase (db) {
+  state.db = db
+  resetStuckSendingRows()
+}
 
 function send (channel, payload) {
   if (state.winRef && !state.winRef.isDestroyed()) {
@@ -281,6 +294,69 @@ function withTimeout (promise, ms, message) {
   })
 }
 
+/**
+ * Run fn exclusively — invoice sends and processQueue share this FIFO chain
+ * so two pupPage.evaluate sends never interleave on a busy WhatsApp Web page.
+ */
+function withSendLock (fn) {
+  const next = state.sendLock.then(fn, fn)
+  state.sendLock = next.then(() => {}, () => {})
+  return next
+}
+
+/** Mark page healthy (health skip window + clear busy after success). */
+function markHealthy () {
+  state.lastHealthyAt = Date.now()
+  state.pageBusyUntil = 0
+  state.inflightSend = null
+}
+
+/**
+ * Soft page recovery — cheap ping first; light reload if evaluate is dead.
+ * Full reconnect() only when this returns false.
+ */
+async function softRecoverPage () {
+  if (!state.client || state.status !== WA_STATE.CONNECTED) return false
+  // 1) ping
+  try {
+    await withTimeout(state.client.getState(), 2500, 'ping timeout')
+    markHealthy()
+    return true
+  } catch (e) {
+    const fatal = /target closed|session closed|Execution context|Protocol error/i.test(e.message)
+    if (!fatal) {
+      // busy but alive — treat as recoverable without reload
+      markHealthy()
+      return true
+    }
+    warn('softRecover: ping fatal:', e.message)
+  }
+  // 2) light reload of the WA Web page
+  try {
+    const page = state.client.pupPage
+    if (page && !page.isClosed()) {
+      log('softRecover: reloading WhatsApp Web page…')
+      await withTimeout(page.reload({ waitUntil: 'domcontentloaded', timeout: 8000 }), 10000, 'reload timeout')
+      await new Promise(r => setTimeout(r, 2500))
+      await withTimeout(state.client.getState(), 4000, 'post-reload ping')
+      markHealthy()
+      log('softRecover: page reload OK')
+      return true
+    }
+  } catch (e) {
+    warn('softRecover: reload failed:', e.message)
+  }
+  return false
+}
+
+/** Recover page for the next send: soft first, full reconnect only if needed. */
+async function recoverForSend () {
+  if (await softRecoverPage()) return true
+  warn('recoverForSend: soft recover failed — full reconnect')
+  await reconnect()
+  return !!(state.client && state.status === WA_STATE.CONNECTED)
+}
+
 function log (...args) { console.log('[SO][WA]', ...args) }
 function warn (...args) { console.warn('[SO][WA]', ...args) }
 function error (...args) { console.error('[SO][WA]', ...args) }
@@ -301,6 +377,36 @@ function sessionExists () {
     return fs.existsSync(sessionPath) && fs.readdirSync(sessionPath).length > 0
   } catch (_) {
     return false
+  }
+}
+
+// Junk that slows Chromium startup massively. Auth lives in
+// session/session/Default/{IndexedDB,Local Storage,Network} — those are KEPT.
+const _PROFILE_PRUNE_DIRS = [
+  'Cache', 'Code Cache', 'GPUCache', 'GPUPersistentCache',
+  'ShaderCache', 'GrShaderCache', 'Service Worker', 'Crashpad',
+  'component_crx_cache', 'extensions_crx_cache', 'optimization_guide_model_store',
+  'DawnCache', 'DawnGraphiteCache', 'DawnWebGPUCache',
+  'BrowserMetrics-spare.pma'
+]
+const _PROFILE_PRUNE_FILES = ['DevToolsActivePort', 'SingletonLock', 'SingletonCookie', 'SingletonSocket', 'Last Browser', 'Last Session']
+
+/**
+ * Delete Chromium cache/lock junk before launch so profile load is fast
+ * and orphan locks from an unclean quit cannot brick initialization.
+ * Keeps auth data (IndexedDB/Cookies/Local Storage) untouched.
+ */
+function pruneSessionProfile () {
+  const { sessionPath } = resolveSessionPaths()
+  const profileDir = path.join(sessionPath, 'session')
+  if (!_exists(profileDir)) return
+  for (const name of _PROFILE_PRUNE_DIRS) {
+    try { fs.rmSync(path.join(profileDir, name), { recursive: true, force: true }) } catch (_) {}
+    try { fs.rmSync(path.join(profileDir, 'Default', name), { recursive: true, force: true }) } catch (_) {}
+  }
+  for (const name of _PROFILE_PRUNE_FILES) {
+    try { fs.rmSync(path.join(profileDir, name), { force: true }) } catch (_) {}
+    try { fs.rmSync(path.join(profileDir, 'Default', name), { force: true }) } catch (_) {}
   }
 }
 
@@ -352,10 +458,6 @@ for (const [country, code] of Object.entries(COUNTRY_DIAL_CODES)) {
 const KNOWN_DIAL_CODES = Object.values(COUNTRY_DIAL_CODES)
   .filter((v, i, a) => a.indexOf(v) === i) // unique
   .sort((a, b) => b.length - a.length)
-
-function log (...args) { console.log('[SO][WA]', ...args) }
-function warn (...args) { console.warn('[SO][WA]', ...args) }
-function error (...args) { console.error('[SO][WA]', ...args) }
 
 function detectCountryFromPhone (cleanedPhone) {
   if (cleanedPhone.startsWith('0')) return null
@@ -466,10 +568,14 @@ function toChatId (normalizedPhone) {
  */
 async function destroyClient () {
   clearInitTimer()
+  state.clientGen++           // invalidate all event handlers from the old client
   const c = state.client
   state.client = null
   state.eventListenersAttached = false
+  state.readyPromise = null
+  state.readyResolver = null
   if (c) {
+    try { c.removeAllListeners && c.removeAllListeners() } catch (_) {}
     try { await c.destroy().catch(() => {}) } catch (_) {}
   }
 }
@@ -481,10 +587,14 @@ async function destroyClient () {
  */
 async function logoutClient () {
   clearInitTimer()
+  state.clientGen++
   const c = state.client
   state.client = null
   state.eventListenersAttached = false
+  state.readyPromise = null
+  state.readyResolver = null
   if (c) {
+    try { c.removeAllListeners && c.removeAllListeners() } catch (_) {}
     try { await c.logout().catch(() => {}) } catch (_) {}
     try { await c.destroy().catch(() => {}) } catch (_) {}
   }
@@ -497,8 +607,13 @@ async function logoutClient () {
 function attachEventListeners (client) {
   if (state.eventListenersAttached) return
   state.eventListenersAttached = true
+  // Capture the generation this listener belongs to — if a new client is
+  // installed (gen bumped), all events from this old client are ignored.
+  const myGen = state.clientGen
+  const stale = () => state.clientGen !== myGen
 
   client.on('qr', async (qr) => {
+    if (stale()) return
     if (state.status !== WA_STATE.AUTHENTICATING && state.status !== WA_STATE.CONNECTED) {
       setStatus(WA_STATE.QR_REQUIRED)
     }
@@ -514,6 +629,7 @@ function attachEventListeners (client) {
   })
 
   client.on('loading_screen', (percent, message) => {
+    if (stale()) return
     log(`Loading: ${percent}% - ${message}`)
     if (state.status !== WA_STATE.CONNECTED && state.status !== WA_STATE.QR_REQUIRED) {
       setStatus(WA_STATE.CONNECTING, { percent })
@@ -521,41 +637,85 @@ function attachEventListeners (client) {
   })
 
   client.on('authenticated', () => {
+    if (stale()) return
     log('Authenticated')
     setStatus(WA_STATE.AUTHENTICATING)
   })
 
   client.on('auth_failure', (msg) => {
+    if (stale()) return
     error('Auth failure:', msg)
     clearInitTimer()
     setStatus(WA_STATE.SESSION_EXPIRED, { reason: 'auth_failure', detail: msg })
-    // Genuine auth failure — invalidate the session so next connect shows QR
-    const failedClient = state.client
-    state.client = null
-    state.eventListenersAttached = false
-    if (failedClient) {
-      try { failedClient.logout().catch(() => {}) } catch (_) {}
-      try { failedClient.destroy().catch(() => {}) } catch (_) {}
+    // Genuine auth failure — invalidate the session so next connect shows QR.
+    // Only touch THIS client (never state.client — could be a newer one).
+    const failedClient = client
+    if (state.client === client) {
+      state.clientGen++
+      state.client = null
+      state.eventListenersAttached = false
     }
+    try { failedClient.removeAllListeners && failedClient.removeAllListeners() } catch (_) {}
+    try { failedClient.logout().catch(() => {}) } catch (_) {}
+    try { failedClient.destroy().catch(() => {}) } catch (_) {}
   })
 
   client.on('ready', () => {
+    if (stale()) return
     clearInitTimer()
     state.qrDataUrl = null
     setStatus(WA_STATE.CONNECTED)
+    markHealthy() // first send after connect skips getState
     log('Client ready — session restored:', sessionExists() ? 'yes' : 'no')
     processQueue()
+
+    if (state.readyResolver) {
+      state.readyResolver()
+      state.readyPromise = null
+      state.readyResolver = null
+    }
   })
 
-  client.on('disconnected', (reason) => {
+  client.on('disconnected', async (reason) => {
+    if (stale()) return
     warn('Disconnected:', reason)
     clearInitTimer()
     state.qrDataUrl = null
-    state.eventListenersAttached = false
-    // DO NOT destroy the client or clear the session here.
-    // Temporary disconnects (network, WhatsApp Web) should preserve the session.
-    // whatsapp-web.js may attempt internal reconnection.
+
+    // LOGOUT means the session is gone — next connect needs QR scan
+    if (reason === 'LOGOUT') {
+      setStatus(WA_STATE.SESSION_EXPIRED, { reason: 'LOGOUT' })
+      return
+    }
+
     setStatus(WA_STATE.DISCONNECTED, { reason })
+
+    // Auto-reconnect: wwjs destroys the browser on bad socket state
+    // (Client.js:853 this.destroy()), so there is NO internal reconnection
+    // to wait for — go straight to destroy+reconnect. Max 2 attempts.
+    if (reason !== 'NAVIGATION') {
+      const myGen = state.clientGen
+      for (let i = 0; i < 2; i++) {
+        const delay = [2000, 5000][i]
+        log(`Auto-reconnect: attempt ${i + 1}/2 in ${delay}ms...`)
+        await new Promise(r => setTimeout(r, delay))
+        // Abort if another path already connected, or a new client took over
+        if (state.status === WA_STATE.CONNECTED || state.status === WA_STATE.INITIALIZING) return
+        if (state.clientGen !== myGen) return
+        try {
+          if (state.client) {
+            state.eventListenersAttached = false
+            try { await state.client.destroy().catch(() => {}) } catch (_) {}
+            if (state.client) state.client = null
+          }
+          const result = await connect()
+          if (result.ok && state.status === WA_STATE.CONNECTED) { log('Auto-reconnect: succeeded on attempt', i + 1); return }
+        } catch (e) {
+          warn('Auto-reconnect attempt', i + 1, 'failed:', e.message)
+        }
+      }
+      warn('Auto-reconnect failed after 2 attempts — manual reconnection required')
+    }
   })
 }
 
@@ -578,15 +738,9 @@ async function connect () {
       if (state.status === WA_STATE.CONNECTED && state.client) {
         return { ok: true, status: WA_STATE.CONNECTED }
       }
-      // Already initializing — reuse in-progress attempt
+      // Already initializing — reuse in-progress attempt (ok reflects REAL state)
       if (state.client && state.status === WA_STATE.INITIALIZING) {
-        return { ok: true, status: state.status }
-      }
-
-      // If we have an existing client that's actually CONNECTED, reuse it
-      if (state.client && state.status === WA_STATE.CONNECTED) {
-        log('Reusing existing connected client')
-        return { ok: true, status: WA_STATE.CONNECTED }
+        return { ok: false, status: WA_STATE.INITIALIZING }
       }
 
       // For any other state (DISCONNECTED, CONNECTING, AUTHENTICATING, QR_REQUIRED, etc.),
@@ -600,6 +754,10 @@ async function connect () {
       const hasSession = sessionExists()
 
       log('Initializing — session path:', sessionPath, '| existing session:', hasSession ? 'YES' : 'NO')
+
+      // Prune Chromium cache/lock junk BEFORE launch: dramatically faster
+      // profile load (433MB → ~60MB) and prevents orphan-lock brick (GH #3976)
+      try { pruneSessionProfile() } catch (_) {}
 
       setStatus(WA_STATE.INITIALIZING)
 
@@ -617,8 +775,12 @@ async function connect () {
           state.client = new Client({
             authStrategy: new LocalAuth({ dataPath: sessionPath }),
             webVersionCache: { type: 'local', path: webCachePath },
+            qrMaxRetries: 10,
+            authTimeoutMs: 60000,
             puppeteer: {
               headless: true,
+              pipe: true,   // stdio pipe instead of WebSocket — faster + more reliable CDP
+              protocolTimeout: 90000, // CDP won't kill mid-upload; app SEND_TIMEOUT still governs UX
               ...(chromePath ? { executablePath: chromePath } : {}),
               args: [
                 '--no-sandbox',
@@ -629,9 +791,14 @@ async function connect () {
                 '--disable-background-networking',
                 '--disable-background-timer-throttling',
                 '--disable-backgrounding-occluded-windows',
-                '--disable-features=site-per-process',
+                '--disable-features=site-per-process,TranslateUI,Translate,BlinkGenPropertyTrees,IsolateOrigins',
                 '--disable-renderer-backgrounding',
                 '--disable-ipc-flooding-protection',
+                '--disable-sync',
+                '--disable-translate',
+                '--metrics-recording-only',
+                '--no-first-run',
+                '--renderer-process-limit=2',
                 '--window-position=-10000,-10000',
                 '--window-size=1280,720'
               ]
@@ -640,28 +807,54 @@ async function connect () {
 
           attachEventListeners(state.client)
 
-          // Init timeout — if neither QR nor ready fires, the launch is stuck.
+          // Init timeout — fires if we're still in INITIALIZING when it expires.
+          // Also bumped clientGen so a late initialize() can't recover into stale state.
           state.initTimer = setTimeout(() => {
             if (state.status === WA_STATE.INITIALIZING) {
               error('Init timeout — WhatsApp Web did not respond')
               state.lastInitError = 'timeout'
               setStatus(WA_STATE.ERROR, { reason: 'timeout', detail: 'WhatsApp Web did not respond. Check your internet connection and that Chrome/Edge is installed, then try again.' })
+              state.clientGen++
               const stuckClient = state.client
               state.client = null
               state.eventListenersAttached = false
               if (stuckClient) {
+                try { stuckClient.removeAllListeners && stuckClient.removeAllListeners() } catch (_) {}
                 try { stuckClient.destroy().catch(() => {}) } catch (_) {}
               }
             }
           }, INIT_TIMEOUT)
 
-          // Start initialization — events update state asynchronously
-          await state.client.initialize()
+          // Create ready promise to wait for 'ready' event
+          state.readyPromise = new Promise(resolve => { state.readyResolver = resolve })
 
-          // If we get here, initialization succeeded — reset retry state
+          // Wrap initialize() in a timeout so a hung page.goto (timeout:0 in
+          // wwjs) can never brick connectionPromise forever.
+          await withTimeout(state.client.initialize(), INIT_TIMEOUT, 'initialize() timed out')
+
+          // Wait for ready event (with timeout) - ensures WhatsApp Web is fully connected
+          try {
+            await Promise.race([
+              state.readyPromise,
+              new Promise((_, reject) => setTimeout(() => reject(new Error('Ready timeout')), 10000))
+            ])
+            log('Ready event received — WhatsApp fully connected')
+          } catch (e) {
+            warn('Ready event timeout, but initialize succeeded — proceeding:', e.message)
+          } finally {
+            state.readyPromise = null
+            state.readyResolver = null
+          }
+
+          // Reset retry state
           state.retryAttempt = 0
           state.lastInitError = null
-          return { ok: true, status: state.status }
+          clearInitTimer()
+          // ok is TRUE only if we actually reached CONNECTED (QR scan still pending
+          // or loading still in-flight must NOT report success to callers)
+          const connected = state.status === WA_STATE.CONNECTED
+          if (connected) setStatus(WA_STATE.CONNECTED) // ensure UI has fresh status
+          return { ok: connected, status: state.status }
 
         } catch (e) {
           lastError = e
@@ -669,11 +862,13 @@ async function connect () {
           error(`Attempt ${attempt + 1} failed:`, e.message)
           clearInitTimer()
 
-          // Clean up failed client
+          // Clean up failed client — bump gen so its listeners go dead
+          state.clientGen++
           const failedClient = state.client
           state.client = null
           state.eventListenersAttached = false
           if (failedClient) {
+            try { failedClient.removeAllListeners && failedClient.removeAllListeners() } catch (_) {}
             try { failedClient.destroy().catch(() => {}) } catch (_) {}
           }
 
@@ -727,13 +922,20 @@ async function disconnect () {
 
 /**
  * Reconnect — stops current client and reinitializes.
- * Preserves the session — does NOT log out.
+ * Serialized through a lock so two concurrent reconnect() calls
+ * (e.g. health-check + auto-reconnect) cannot interleave destroy/create.
  */
-async function reconnect () {
-  clearInitTimer()
-  await destroyClient()
-  state.qrDataUrl = null
-  return connect()
+function reconnect () {
+  const run = async () => {
+    clearInitTimer()
+    await destroyClient()
+    state.qrDataUrl = null
+    return connect()
+  }
+  const next = state.reconnectLock.then(run, run)
+  // Keep the chain alive even if this reconnect rejects
+  state.reconnectLock = next.catch(() => {})
+  return next
 }
 
 /**
@@ -776,10 +978,37 @@ function getQR () {
 
 // ── Sending ─────────────────────────────────────────────────────────────
 
-// Track if we've already attempted a retry for the current send
-let sendRetryAttempted = false
+// Per-chat retry tracking — a global boolean let concurrent sends stomp
+// each other's retry state (send A consumes retry, send B unlocks it, etc.)
+const sendRetryAttempted = new Map() // chatId -> true
 
-async function sendMessage ({ phone, countryCode, imageBase64, caption, mime, message }) {
+function _retryKey (chatId, hasImage) {
+  return (chatId || 'unknown') + (hasImage ? ':img' : ':txt')
+}
+
+async function sendMessage (payload) {
+  // FIFO: invoice IPC + processQueue never interleave evaluates
+  return withSendLock(() => sendMessageLocked(payload))
+}
+
+async function sendMessageLocked ({
+  phone, countryCode, imageBase64, caption, mime, message,
+  _skipHealth, _asDocument, _fromRetry
+}) {
+  // ── Wait out a timed-out predecessor (zombie evaluate still on page) ──
+  if (state.inflightSend) {
+    log('sendMessage: waiting for in-flight send to settle…')
+    // Cap wait: hang zombies must not block forever — 20s then force-clear
+    try { await withTimeout(state.inflightSend, 20000, 'inflight wait') } catch (_) {}
+    if (state.inflightSend) state.inflightSend = null
+  }
+  if (state.pageBusyUntil > Date.now()) {
+    const waitMs = state.pageBusyUntil - Date.now()
+    log('sendMessage: page busy, waiting', waitMs, 'ms…')
+    await new Promise(r => setTimeout(r, waitMs))
+    state.pageBusyUntil = 0
+  }
+
   // Auto-connect if not ready (for queue processing and direct calls)
   if (!state.client || state.status !== WA_STATE.CONNECTED) {
     log('sendMessage: not connected, attempting to connect...')
@@ -788,6 +1017,38 @@ async function sendMessage ({ phone, countryCode, imageBase64, caption, mime, me
       log('sendMessage: still not connected after connect()', { status: state.status, hasClient: !!state.client })
       return { ok: false, error: 'NOT_READY' }
     }
+  }
+
+  // Health check — skipped when: retry already verified, or last healthy < HEALTH_SKIP_MS ago
+  const healthFresh = (Date.now() - state.lastHealthyAt) < HEALTH_SKIP_MS
+  if (!_skipHealth && !healthFresh) {
+    const DEAD_STATES = ['UNPAIRED', 'UNPAIRED_IDLE', 'DEPRECATED_VERSION', 'TOS_BLOCK', 'PROXYBLOCK', 'SMB_TOS_BLOCK', 'CONFLICT']
+    let healthOk = false
+    try {
+      const waState = await withTimeout(state.client.getState(), HEALTH_TIMEOUT, 'Health check timeout')
+      if (waState == null || !DEAD_STATES.includes(waState)) {
+        healthOk = true
+        markHealthy()
+      } else {
+        warn('sendMessage: health check dead state:', waState)
+      }
+    } catch (e) {
+      const fatal = /target closed|session closed|Execution context|Protocol error/i.test(e.message)
+      if (!fatal) {
+        healthOk = true // busy page is not fatal
+      } else {
+        warn('sendMessage: health check fatal:', e.message)
+      }
+    }
+    if (!healthOk) {
+      warn('sendMessage: connection dead — soft recover before send')
+      if (!(await recoverForSend())) {
+        return { ok: false, error: 'NOT_READY' }
+      }
+    }
+  } else if (_skipHealth || healthFresh) {
+    // cheap trust path — still clear any stale busy from earlier success
+    if (state.pageBusyUntil && state.pageBusyUntil <= Date.now()) state.pageBusyUntil = 0
   }
 
   log('sendMessage: sending to', { phone, countryCode, hasImage: !!imageBase64, hasMessage: !!message })
@@ -804,76 +1065,214 @@ async function sendMessage ({ phone, countryCode, imageBase64, caption, mime, me
     return { ok: false, error: 'INVALID_PHONE', detail: 'Could not create valid WhatsApp chat ID' }
   }
 
-  log('sendMessage: sending', { chatId, normalized, detectedCountry, usedAutoDetect })
+  log('sendMessage: sending', { chatId, normalized, detectedCountry, usedAutoDetect, asDocument: !!_asDocument })
+  const rKey = _retryKey(chatId, !!imageBase64)
 
+  // Build the real evaluate promise — we keep a reference so a timeout
+  // does NOT orphan it: inflightSend/pageBusyUntil gate the next send.
+  let sendPromise
   try {
     if (imageBase64) {
       log('sendMessage: creating MessageMedia, base64 length:', imageBase64.length)
       const ext = (mime || 'image/jpeg').includes('png') ? 'png' : 'jpg'
       const media = new MessageMedia(mime || 'image/jpeg', imageBase64, `invoice.${ext}`)
-      await withTimeout(state.client.sendMessage(chatId, media, { caption: caption || '' }), SEND_TIMEOUT, 'Send timed out after 30 seconds')
+      const opts = { caption: caption || '', sendSeen: false }
+      if (_asDocument) opts.sendMediaAsDocument = true
+      sendPromise = state.client.sendMessage(chatId, media, opts)
     } else if (message) {
-      await withTimeout(state.client.sendMessage(chatId, message), SEND_TIMEOUT, 'Send timed out after 30 seconds')
+      sendPromise = state.client.sendMessage(chatId, message, { sendSeen: false })
     } else {
       return { ok: false, error: 'NO_CONTENT' }
     }
-    log('sendMessage: sent successfully', { chatId })
-    sendRetryAttempted = false // Reset on success
-    return { ok: true }
   } catch (e) {
-    const msg = e.message || ''
-    log('sendMessage: error caught', { chatId, error: msg })
+    // synchronous construction failure — no zombie
+    return _classifySendError(e, { phone, countryCode, imageBase64, caption, mime, message, chatId, rKey, _fromRetry, _asDocument, sendPromise: null, timedOut: false })
+  }
 
-    // Check for specific WhatsApp Web internal error: "Data passed to getter must include an id property"
-    const isMemoizeError = msg.includes('Data passed to getter must include an id property') ||
-                           msg.includes('memoize') ||
-                           msg.includes('undefined s')
-
-    // Check for other common WhatsApp Web internal errors
-    const isWhatsAppInternalError = isMemoizeError ||
-                                    msg.includes('Cannot read propert') ||
-                                    msg.includes('Cannot read properties of undefined') ||
-                                    msg.includes('getter must include') ||
-                                    msg.includes('Store.getId')
-
-    if (msg.includes('not registered') || msg.includes('not on WhatsApp') || msg.includes('invalid')) {
-      sendRetryAttempted = false
-      return { ok: false, error: 'NOT_ON_WHATSAPP' }
-    }
-
-    // If it's a WhatsApp Web internal error and we haven't retried yet, attempt reconnect + retry
-    if (isWhatsAppInternalError && !sendRetryAttempted) {
-      warn('sendMessage: WhatsApp Web internal error detected, attempting auto-reconnect and retry:', msg)
-      sendRetryAttempted = true
-
-      try {
-        await reconnect()
-        log('sendMessage: reconnected, retrying send...')
-        return sendMessage({ phone, countryCode, imageBase64, caption, mime, message })
-      } catch (retryErr) {
-        error('sendMessage: retry after reconnect failed:', retryErr.message)
+  // Track zombie: resolve/reject of the REAL promise clears inflight
+  state.inflightSend = sendPromise
+  sendPromise.then(
+    () => {
+      sendPromise.__waSettled = true
+      if (state.inflightSend === sendPromise) markHealthy()
+    },
+    () => {
+      sendPromise.__waSettled = true
+      if (state.inflightSend === sendPromise) {
+        state.inflightSend = null
+        state.pageBusyUntil = Date.now() + PAGE_BUSY_MS
       }
     }
+  )
 
-    sendRetryAttempted = false
-    error('sendMessage failed:', msg)
-    return { ok: false, error: 'SEND_FAILED', detail: msg }
+  try {
+    await withTimeout(sendPromise, SEND_TIMEOUT, 'Send timed out')
+    log('sendMessage: sent successfully', { chatId })
+    sendRetryAttempted.delete(rKey)
+    markHealthy()
+    return { ok: true }
+  } catch (e) {
+    // On timeout the evaluate keeps running — mark page busy so send #2/#3 wait
+    const timedOut = (e.message || '').includes('Send timed out')
+    if (timedOut) {
+      state.pageBusyUntil = Date.now() + PAGE_BUSY_MS
+      // leave inflightSend set — next call waits on it
+    }
+    return _classifySendError(e, { phone, countryCode, imageBase64, caption, mime, message, chatId, rKey, _fromRetry, _asDocument, sendPromise, timedOut })
   }
 }
 
-async function sendInvoiceImage ({ phone, countryCode, imageBase64, caption, mime }) {
-  // Ensure WhatsApp is connected before sending
-  if (!state.client || state.status !== WA_STATE.CONNECTED) {
-    log('sendInvoiceImage: not connected, initiating connection...', { status: state.status, hasClient: !!state.client })
-    await connect()  // Wait for connection to complete
+/**
+ * Shared error handling for media/text sends.
+ * Recovery ladder:
+ *   internal wwjs error → soft recover → retry once (skip health)
+ *   timeout/hang        → if zombie ok → success; if hung image → reload + document retry
+ *   fatal page          → soft recover / reconnect → retry once
+ */
+function _isSettled (p) {
+  if (!p) return true
+  // Promise.race trick: if already settled, microtask runs before 0ms timer callback order isn't reliable —
+  // use a flag attached in sendMessageLocked instead when available.
+  return !!p.__waSettled
+}
 
-    // Check again after connection attempt
-    if (!state.client || state.status !== WA_STATE.CONNECTED) {
-      log('sendInvoiceImage: still not connected after connect()', { status: state.status, hasClient: !!state.client })
+async function _classifySendError (e, ctx) {
+  const { phone, countryCode, imageBase64, caption, mime, message, chatId, rKey, _fromRetry, _asDocument, sendPromise, timedOut } = ctx
+  const msg = e.message || ''
+  log('sendMessage: error caught', { chatId, error: msg })
+
+  const isMemoizeError = msg.includes('Data passed to getter must include an id property') ||
+                         msg.includes('memoize') ||
+                         msg.includes('undefined s')
+  const isWhatsAppInternalError = isMemoizeError ||
+                                  msg.includes('Cannot read propert') ||
+                                  msg.includes('Cannot read properties of undefined') ||
+                                  msg.includes('getter must include') ||
+                                  msg.includes('Store.getId')
+  const isTimeout = !!timedOut || msg.includes('Send timed out')
+  const isFatalPage = /target closed|session closed|Execution context|Protocol error/i.test(msg)
+
+  if (msg.includes('not registered') || msg.includes('not on WhatsApp') || (msg.includes('invalid') && !isWhatsAppInternalError)) {
+    sendRetryAttempted.delete(rKey)
+    return { ok: false, error: 'NOT_ON_WHATSAPP' }
+  }
+
+  if (_fromRetry) {
+    sendRetryAttempted.delete(rKey)
+    if (isTimeout) return { ok: false, error: 'SEND_FAILED', detail: 'Send timed out — check your internet connection and try again' }
+    error('sendMessage failed:', msg)
+    return { ok: false, error: 'SEND_FAILED', detail: msg }
+  }
+
+  // ── Timeout: brief zombie wait; if IT succeeded, report success (no double-send) ──
+  if (isTimeout) {
+    warn('sendMessage: timed out — brief wait for in-flight evaluate…')
+    let zombieOk = false
+    let zombieStillRunning = false
+    const inflight = sendPromise || state.inflightSend
+    if (inflight) {
+      // Hang case: zombie never settles — only wait 3s before declaring hung
+      try {
+        await withTimeout(inflight, 3000, 'zombie wait')
+        zombieOk = true
+      } catch (_) {
+        zombieStillRunning = !_isSettled(inflight)
+      }
+    }
+    if (state.inflightSend === sendPromise || state.inflightSend === inflight) state.inflightSend = null
+    state.pageBusyUntil = 0
+
+    if (zombieOk) {
+      log('sendMessage: zombie send completed OK after timeout', { chatId })
+      sendRetryAttempted.delete(rKey)
+      markHealthy()
+      return { ok: true }
+    }
+
+    // Hung zombie: force page reload (kills the stuck evaluate), then document fallback
+    if (zombieStillRunning && imageBase64 && !_asDocument) {
+      warn('sendMessage: zombie hung — force reload + document fallback')
+      state.inflightSend = null // reload orphans it
+      try {
+        const page = state.client && state.client.pupPage
+        if (page && !page.isClosed()) {
+          await withTimeout(page.reload({ waitUntil: 'domcontentloaded', timeout: 8000 }), 10000, 'reload timeout')
+          await new Promise(r => setTimeout(r, 2500))
+        }
+      } catch (reloadErr) {
+        warn('sendMessage: force reload failed:', reloadErr.message)
+      }
+      if (!(state.client && state.status === WA_STATE.CONNECTED) || !(await softRecoverPage())) {
+        if (!(await recoverForSend())) {
+          sendRetryAttempted.delete(rKey)
+          return { ok: false, error: 'NOT_READY' }
+        }
+      }
+      sendRetryAttempted.set(rKey, true)
+      return sendMessageLocked({ phone, countryCode, imageBase64, caption, mime, message, _skipHealth: true, _asDocument: true, _fromRetry: true })
+    }
+
+    // Zombie still running (text or document path): leave busy gate for next send
+    if (zombieStillRunning) {
+      state.inflightSend = inflight
+      state.pageBusyUntil = Date.now() + PAGE_BUSY_MS
+      sendRetryAttempted.delete(rKey)
+      return { ok: false, error: 'SEND_FAILED', detail: 'Send timed out — check your internet connection and try again' }
+    }
+
+    warn('sendMessage: zombie dead — soft recover, then document fallback')
+    if (!(await recoverForSend())) {
+      sendRetryAttempted.delete(rKey)
       return { ok: false, error: 'NOT_READY' }
     }
+    if (imageBase64 && !_asDocument) {
+      warn('sendMessage: retrying as document (image pipeline hang workaround)')
+      sendRetryAttempted.set(rKey, true)
+      return sendMessageLocked({ phone, countryCode, imageBase64, caption, mime, message, _skipHealth: true, _asDocument: true, _fromRetry: true })
+    }
+    sendRetryAttempted.delete(rKey)
+    return { ok: false, error: 'SEND_FAILED', detail: 'Send timed out — check your internet connection and try again' }
   }
+
+  // ── WhatsApp Web internal error — soft recover + one retry ──
+  if (isWhatsAppInternalError && !sendRetryAttempted.get(rKey)) {
+    warn('sendMessage: WhatsApp Web internal error, recovering and retrying:', msg)
+    sendRetryAttempted.set(rKey, true)
+    try {
+      if (!(await recoverForSend())) {
+        sendRetryAttempted.delete(rKey)
+        return { ok: false, error: 'NOT_READY' }
+      }
+      log('sendMessage: recovered, retrying send...')
+      return sendMessageLocked({ phone, countryCode, imageBase64, caption, mime, message, _skipHealth: true, _fromRetry: true })
+    } catch (retryErr) {
+      error('sendMessage: retry after recover failed:', retryErr.message)
+    }
+  }
+
+  // ── Fatal page error (closed target etc.) — recover once ──
+  if (isFatalPage && !sendRetryAttempted.get(rKey)) {
+    warn('sendMessage: fatal page error, recovering and retrying:', msg)
+    sendRetryAttempted.set(rKey, true)
+    try {
+      if (!(await recoverForSend())) {
+        sendRetryAttempted.delete(rKey)
+        return { ok: false, error: 'NOT_READY' }
+      }
+      return sendMessageLocked({ phone, countryCode, imageBase64, caption, mime, message, _skipHealth: true, _fromRetry: true })
+    } catch (retryErr) {
+      error('sendMessage: retry after fatal recover failed:', retryErr.message)
+    }
+  }
+
+  sendRetryAttempted.delete(rKey)
+  error('sendMessage failed:', msg)
+  return { ok: false, error: 'SEND_FAILED', detail: msg }
+}
+
+async function sendInvoiceImage ({ phone, countryCode, imageBase64, caption, mime }) {
   if (!imageBase64) return { ok: false, error: 'NO_IMAGE' }
+  // Connection handling lives solely in sendMessage() — no redundant gate here
   return sendMessage({ phone, countryCode, imageBase64, caption, mime })
 }
 
@@ -959,14 +1358,16 @@ async function processQueue () {
 
 function registerHandlers (ipcMain) {
   ipcMain.handle('WA_INIT', async () => {
-    connect()
-    return { ok: true }
+    const result = await connect()
+    return result
   })
   ipcMain.handle('SEND_INVOICE_WHATSAPP', async (e, payload) => sendInvoiceImage(payload))
   ipcMain.handle('WA_GET_STATUS', async () => getStatus())
   ipcMain.handle('WA_RECONNECT', async () => {
-    await reconnect()
-    return { ok: true }
+    const result = await reconnect()
+    // Return the REAL connect result — callers need ok=false when QR is
+    // still pending or init failed (a hardcoded ok:true hid failures).
+    return result && typeof result === 'object' ? result : { ok: false, status: state.status }
   })
   ipcMain.handle('WA_CONNECT', async () => connect())
   ipcMain.handle('WA_DISCONNECT', async () => { await disconnect(); return { ok: true } })
@@ -975,6 +1376,20 @@ function registerHandlers (ipcMain) {
   ipcMain.handle('WA_SEND_MESSAGE', async (e, payload) => sendMessage(payload))
   ipcMain.handle('WA_QUEUE_MESSAGE', async (e, payload) => queueMessage(payload))
   ipcMain.handle('WA_GET_QUEUE_STATUS', async () => getQueueStatus())
+}
+
+// Pre-cache browser path at module load time so first connect() is faster
+setTimeout(() => { try { findBrowser() } catch (_) {} }, 0)
+
+// Reset rows stuck in SENDING from a previous unclean shutdown — processQueue
+// only picks PENDING/RETRYING, so orphaned SENDING rows would never send again.
+function resetStuckSendingRows () {
+  if (!state.db) return
+  try {
+    const n = state.db.prepare(`UPDATE wa_message_queue SET status = ? WHERE status = ?`)
+      .run(MQ_STATUS.RETRYING, MQ_STATUS.SENDING)
+    if (n && n.changes > 0) log('Reset', n.changes, 'stuck SENDING queue row(s) → RETRYING')
+  } catch (_) {}
 }
 
 module.exports = {

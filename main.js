@@ -64,10 +64,17 @@ app.whenReady().then(() => {
   db.setWinRef(win)
   db.registerHandlers(ipcMain)
 
-  // ── WhatsApp automation (lazy — initialized on first use, not at startup) ──
+  // ── WhatsApp automation ────────────────────────────────────────────
   wa.setWinRef(win)
   wa.setDatabase(db.getDb())
   wa.registerHandlers(ipcMain)
+
+  // Warm-start at boot (approved): begin connect in the background BEFORE
+  // the renderer asks, so first-time QR / restore is ready when user opens
+  // WhatsApp UI. Fire-and-forget — connect() is internally serialized.
+  setTimeout(() => {
+    wa.connect().then(r => console.log('[WA] warm-start result:', r)).catch(e => console.error('[WA] warm-start error:', e.message))
+  }, 500)
 
   // ── Path / storage info handlers ────────────────────────────────────
   ipcMain.handle('GET_PATH',         () => paths.dbFile   || '')
@@ -166,6 +173,10 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', (e) => {
+  // Destroy WA browser first — otherwise Chromium orphans + SingletonLock
+  // brick the next launch (wwebjs issue #3976). Fire-and-forget so quit isn't blocked.
+  try { wa.disconnect().catch(() => {}) } catch (_) {}
+
   if (!db.isOpen() || db.backupDone()) return
   e.preventDefault()
   console.log('[SO] before-quit: backing up...')
